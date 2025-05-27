@@ -10,6 +10,14 @@ sed -i 's|^deb https://enterprise.proxmox.com|#deb https://enterprise.proxmox.co
 # Adiciona o repositório sem assinatura (no-subscription)
 echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
 
+# Remove repositórios Ceph enterprise se existirem
+rm -f /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.bak 2>/dev/null
+
+# Adiciona repositório livre (no-subscription)
+echo "deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
+echo "deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
+echo "deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
+
 # Mensagens de status
 msg_info()   { echo -e "\033[36mℹ️\033[0m $1"; }
 msg_ok()     { echo -e "\033[32m✅\033[0m $1"; }
@@ -20,9 +28,10 @@ if ! echo "$cpu_vendor" | grep -qi 'intel'; then
     msg_error "CPU não é Intel. Abortando."
     exit 1
 fi
+clear
 # Instalar iucode-tool (útil para carregamento de microcódigo manual)
 msg_info "Instalando dependência: iucode-tool..."
-apt-get update -qq
+apt-get update -qq &>/dev/null
 apt-get install -y iucode-tool &>/dev/null
 msg_ok "iucode-tool instalado."
 # Buscar e instalar o pacote mais recente do microcódigo Intel
@@ -70,10 +79,9 @@ desabilitar_pve_enterprise() {
 corrigir_repositorios_ceph() {
     msg_info "Corrigindo repositórios do Ceph..."
     cat >/etc/apt/sources.list.d/ceph.list <<EOF
-# deb https://enterprise.proxmox.com/debian/ceph-quincy bookworm enterprise
-# deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription
-# deb https://enterprise.proxmox.com/debian/ceph-reef bookworm enterprise
-# deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription
+deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription
+deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription
+deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription
 EOF
     msg_ok "Repositórios do Ceph corrigidos."
 }
@@ -150,5 +158,5 @@ corrigir_repositorios_ceph
 desabilitar_avisos_assinatura
 atualizar_proxmox
 ocultar_avisos
-iDRAC7
+#iDRAC7
 reiniciar_sistema
