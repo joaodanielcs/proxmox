@@ -88,18 +88,21 @@ EOF
 
 # Função para desabilitar o aviso de assinatura
 desabilitar_avisos_assinatura() {
-    local NAG_FILE="/etc/apt/apt.conf.d/no-nag-script"
-    if [[ ! -f "$NAG_FILE" ]]; then
-        msg_info "Desabilitando aviso de assinatura (subscription nag)..."
-        # Cria o script de pós-instalação para remover o aviso
-        echo 'DPkg::Post-Invoke { "dpkg -V proxmox-widget-toolkit | grep -q \"/proxmoxlib\\.js$\"; if [ $? -eq 1 ]; then { echo \"Removing subscription nag from UI...\"; sed -i \"/.*data\\.status.*{/{s/\\!//;s/active/NoMoreNagging/}\" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; }; fi"; };' > "$NAG_FILE"
-        # Reinstala o pacote para acionar o hook
-        apt --reinstall install proxmox-widget-toolkit -y &>/dev/null
-        msg_ok "Aviso de assinatura desabilitado (limpe o cache do navegador)."
+    msg_info "Removendo aviso de assinatura da interface web (no nag)..."
+    local JS_FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+
+    if [ -f "$JS_FILE" ]; then
+        cp "$JS_FILE" "${JS_FILE}.bak"
+
+        sed -i.bak -E "s/(!)?(data\.status\.subscription)/\2/" "$JS_FILE"
+        sed -i -E "s/Proxmox VE Subscription/Proxmox VE No-Subscription/" "$JS_FILE"
+
+        msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
     else
-        msg_info "Aviso de assinatura já está desabilitado."
+        msg_error "Arquivo JavaScript não encontrado: $JS_FILE"
     fi
 }
+
 
 # Função para atualizar o Proxmox VE
 atualizar_proxmox() {
@@ -120,8 +123,7 @@ reiniciar_sistema() {
 ocultar_avisos() {
     sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="quiet"/GRUB_CMDLINE_LINUX_DEFAULT="quiet mitigations=off"/' /etc/default/grub
     sed -i 's/root=ZFS=rpool\/ROOT\/pve-1 boot=zfs/root=ZFS=rpool\/ROOT\/pve-1 boot=zfs mitigations=off/' /etc/kernel/cmdline
-    update-grub
-    proxmox-boot-tool refresh
+    proxmox-boot-tool refresh > /dev/null 2>&1
 }
 
 # Ajustar iDRAC7
@@ -133,7 +135,7 @@ iDRAC7() {
     apt install -y alien &>/dev/null
     alien srvadmin-*.rpm &>/dev/null
     dpkg -i *.deb &>/dev/null
-    rm /usr/local/bin/racadm
+    rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
     cd ~
     wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" -O Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz "https://dl.dell.com/FOLDER12236395M/1/Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz" &>/dev/null
@@ -141,13 +143,13 @@ iDRAC7() {
     cd iDRACTools/racadm/RHEL8/x86_64
     alien srvadmin-*.rpm &>/dev/null
     dpkg -i *.deb &>/dev/null
-    rm /usr/local/bin/racadm
+    rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
     cd ~
     cd iDRACTools/racadm/UBUNTU22/x86_64
     alien srvadmin-*.rpm &>/dev/null
     dpkg -i *.deb &>/dev/null
-    rm /usr/local/bin/racadm
+    rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
 }
 
