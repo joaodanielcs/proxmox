@@ -10,13 +10,6 @@ sed -i 's|^deb https://enterprise.proxmox.com|#deb https://enterprise.proxmox.co
 # Adiciona o repositório sem assinatura (no-subscription)
 echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
 
-
-
-
-
-
-
-
 # Mensagens de status
 msg_info()   { echo -e "\033[36mℹ️\033[0m $1"; }
 msg_ok()     { echo -e "\033[32m✅\033[0m $1"; }
@@ -53,4 +46,109 @@ msg_ok "Arquivo removido."
 msg_info "Reiniciando serviço de microcódigo..."
 systemctl restart microcode.service &>/dev/null || true
 msg_ok "Serviço reiniciado (se aplicável)."
-msg_info "Atualização concluída. É recomendável reiniciar o sistema."
+
+# Função para corrigir repositórios do Proxmox VE
+corrigir_repositorios() {
+    msg_info "Corrigindo repositórios do Proxmox VE..."
+    cat > /etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian bookworm main contrib
+deb http://deb.debian.org/debian bookworm-updates main contrib
+deb http://security.debian.org/debian-security bookworm-security main contrib
+EOF
+    echo 'APT::Get::Update::SourceListWarnings::NonFreeFirmware "false";' > /etc/apt/apt.conf.d/no-bookworm-firmware.conf
+    msg_ok "Repositórios corrigidos."
+}
+
+# Função para desabilitar o repositório 'pve-enterprise'
+desabilitar_pve_enterprise() {
+    msg_info "Desabilitando repositório 'pve-enterprise'..."
+    mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.bak
+    msg_ok "Repositório 'pve-enterprise' desabilitado."
+}
+
+# Função para corrigir repositórios do Ceph
+corrigir_repositorios_ceph() {
+    msg_info "Corrigindo repositórios do Ceph..."
+    cat >/etc/apt/sources.list.d/ceph.list <<EOF
+# deb https://enterprise.proxmox.com/debian/ceph-quincy bookworm enterprise
+# deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription
+# deb https://enterprise.proxmox.com/debian/ceph-reef bookworm enterprise
+# deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription
+EOF
+    msg_ok "Repositórios do Ceph corrigidos."
+}
+
+# Função para desabilitar o aviso de assinatura
+desabilitar_avisos_assinatura() {
+    local NAG_FILE="/etc/apt/apt.conf.d/no-nag-script"
+    if [[ ! -f "$NAG_FILE" ]]; then
+        msg_info "Desabilitando aviso de assinatura (subscription nag)..."
+        # Cria o script de pós-instalação para remover o aviso
+        echo 'DPkg::Post-Invoke { "dpkg -V proxmox-widget-toolkit | grep -q \"/proxmoxlib\\.js$\"; if [ $? -eq 1 ]; then { echo \"Removing subscription nag from UI...\"; sed -i \"/.*data\\.status.*{/{s/\\!//;s/active/NoMoreNagging/}\" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; }; fi"; };' > "$NAG_FILE"
+        # Reinstala o pacote para acionar o hook
+        apt --reinstall install proxmox-widget-toolkit -y &>/dev/null
+        msg_ok "Aviso de assinatura desabilitado (limpe o cache do navegador)."
+    else
+        msg_info "Aviso de assinatura já está desabilitado."
+    fi
+}
+
+# Função para atualizar o Proxmox VE
+atualizar_proxmox() {
+    msg_info "Atualizando Proxmox VE...(Paciência)"
+    apt-get update &>/dev/null
+    apt-get -y dist-upgrade &>/dev/null
+    msg_ok "Proxmox VE atualizado."
+}
+
+# Função para reiniciar o sistema
+reiniciar_sistema() {
+    msg_info "Reiniciando o sistema..."
+    history -c
+    reboot
+}
+
+# Função para ocultar avisos
+ocultar_avisos() {
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="quiet"/GRUB_CMDLINE_LINUX_DEFAULT="quiet mitigations=off"/' /etc/default/grub
+    sed -i 's/root=ZFS=rpool\/ROOT\/pve-1 boot=zfs/root=ZFS=rpool\/ROOT\/pve-1 boot=zfs mitigations=off/' /etc/kernel/cmdline
+    update-grub
+    proxmox-boot-tool refresh
+}
+
+# Ajustar iDRAC7
+iDRAC7() {
+    cd ~
+    wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" -O Dell-iDRACTools-Web-LX.tar.gz "https://dl.dell.com/FOLDER09667202M/1/Dell-iDRACTools-Web-LX-11.1.0.0-5294_A00.tar.gz" &>/dev/null
+    tar -xvf Dell-iDRACTools-Web-LX.tar.gz &>/dev/null
+    cd iDRACTools/racadm/RHEL8/x86_64
+    apt install -y alien &>/dev/null
+    alien srvadmin-*.rpm &>/dev/null
+    dpkg -i *.deb &>/dev/null
+    rm /usr/local/bin/racadm
+    ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+    cd ~
+    wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" -O Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz "https://dl.dell.com/FOLDER12236395M/1/Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz" &>/dev/null
+    tar -xvf Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz &>/dev/null
+    cd iDRACTools/racadm/RHEL8/x86_64
+    alien srvadmin-*.rpm &>/dev/null
+    dpkg -i *.deb &>/dev/null
+    rm /usr/local/bin/racadm
+    ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+    cd ~
+    cd iDRACTools/racadm/UBUNTU22/x86_64
+    alien srvadmin-*.rpm &>/dev/null
+    dpkg -i *.deb &>/dev/null
+    rm /usr/local/bin/racadm
+    ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+}
+
+# Execução das funções
+corrigir_repositorios
+desabilitar_pve_enterprise
+corrigir_repositorios_ceph
+desabilitar_avisos_assinatura
+atualizar_proxmox
+ocultar_avisos
+iDRAC7
+reiniciar_sistema
