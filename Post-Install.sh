@@ -71,8 +71,13 @@ EOF
 # Função para desabilitar o repositório 'pve-enterprise'
 desabilitar_pve_enterprise() {
     msg_info "Desabilitando repositório 'pve-enterprise'..."
-    mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.bak
-    msg_ok "Repositório 'pve-enterprise' desabilitado."
+    local FILE="/etc/apt/sources.list.d/pve-enterprise.list"
+    if [[ -f "$FILE" ]]; then
+        mv "$FILE" "$FILE.bak"
+        msg_ok "Repositório 'pve-enterprise' desabilitado."
+    else
+        msg_info "'pve-enterprise.list' não encontrado. Nenhuma ação necessária."
+    fi
 }
 
 # Função para corrigir repositórios do Ceph
