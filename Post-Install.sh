@@ -1,9 +1,26 @@
 #!/bin/bash
 
+
+# Backup do sources.list.d atual
+cp /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.bak 2>/dev/null
+
+# Comenta o repositório enterprise (se existir)
+sed -i 's|^deb https://enterprise.proxmox.com|#deb https://enterprise.proxmox.com|' /etc/apt/sources.list.d/pve-enterprise.list 2>/dev/null
+
+# Adiciona o repositório sem assinatura (no-subscription)
+echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
+
+
+
+
+
+
+
+
 # Mensagens de status
-msg_info() { echo -e "\033[33m[INFO]\033[0m $1"; }
-msg_ok()   { echo -e "\033[32m[OK]\033[0m $1"; }
-msg_error(){ echo -e "\033[31m[ERROR]\033[0m $1"; }
+msg_info()   { echo -e "\033[36mℹ️\033[0m $1"; }
+msg_ok()     { echo -e "\033[32m✅\033[0m $1"; }
+msg_error()  { echo -e "\033[31m❌\033[0m $1"; }
 # Verificar se a CPU é Intel
 cpu_vendor=$(lscpu | grep -i 'Vendor ID' | awk '{print $3}')
 if ! echo "$cpu_vendor" | grep -qi 'intel'; then
