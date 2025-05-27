@@ -5,11 +5,11 @@ msg_info() { echo -e "\033[33m[INFO]\033[0m $1"; }
 msg_ok()   { echo -e "\033[32m[OK]\033[0m $1"; }
 msg_error(){ echo -e "\033[31m[ERROR]\033[0m $1"; }
 # Verificar se a CPU é Intel
-# cpu_vendor=$(lscpu | grep -oP 'Vendor ID:\s*\K\S+')
-# if [[ "$cpu_vendor" != "GenuineIntel" ]]; then
-#     msg_error "CPU não é Intel. Abortando."
-#     exit 1
-# fi
+cpu_vendor=$(lscpu | grep -i 'Vendor ID' | awk '{print $3}')
+if ! echo "$cpu_vendor" | grep -qi 'intel'; then
+    msg_error "CPU não é Intel. Abortando."
+    exit 1
+fi
 # Instalar iucode-tool (útil para carregamento de microcódigo manual)
 msg_info "Instalando dependência: iucode-tool..."
 apt-get update -qq
