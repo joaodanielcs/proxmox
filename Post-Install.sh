@@ -301,7 +301,6 @@ install_keepalive() {
       UNICAST_SRC_IP="192.168.0.33"
       UNICAST_PEER1="192.168.0.31" 
       UNICAST_PEER2="192.168.0.32"
-  else
   fi
   cat  >/etc/keepalived/keepalived.conf <<EOF
 vrrp_instance VI_1 {
