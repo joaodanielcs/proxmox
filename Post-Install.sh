@@ -96,16 +96,6 @@ EOF
 # Função para desabilitar o aviso de assinatura
 desabilitar_avisos_assinatura() {
     msg_info "Removendo aviso de assinatura da interface web (no nag)..."
-    #cat >/etc/apt/apt.conf.d/no-nag-script <<EOF
-#DPkg::Post-Invoke {
-#  "dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; \
-#  if [ $? -eq 1 ]; then \
-#    echo 'Removing subscription nag from UI...'; \
-#    sed -i '/.*data\.status.*{/{s/!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; \
-#  fi";
-#};
-#EOF
-#    apt --reinstall install proxmox-widget-toolkit &>/dev/null
     echo "DPkg::Post-Invoke { \"dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; if [ \$? -eq 1 ]; then { echo 'Removendo banner de assinatura do UI...'; sed -i '/data.status/{s/\!//;s/Active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; }; fi\"; };" > /etc/apt/apt.conf.d/no-nag-script
     apt --reinstall install proxmox-widget-toolkit &>/dev/null
     msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
@@ -170,6 +160,175 @@ iDRAC7() {
     racadm set iDRAC.Users.2.Password $IDRAC_PASSWORD
 }
 
+
+interfaces_bond() {
+  msg_info "Criando Interfaces bonding"
+  cp /etc/network/interfaces /etc/network/interfaces.bak
+  HOSTNAME=$(hostname)
+  # Definindo os valores de CIDR de acordo com o hostname
+  if [[ "$HOSTNAME" == "pve01" ]]; then
+      BOND0_CIDR="192.168.0.31/21"
+      BOND2_CIDR="172.31.163.1/28"
+  elif [[ "$HOSTNAME" == "pve02" ]]; then
+      BOND0_CIDR="192.168.0.32/21"
+      BOND2_CIDR="172.31.163.2/28"
+  elif [[ "$HOSTNAME" == "pve03" ]]; then
+      BOND0_CIDR="192.168.0.33/21"
+      BOND2_CIDR="172.31.163.3/28"
+  else
+      msg_error "Hostname não reconhecido! Saindo..."
+      exit 1
+  fi
+
+  # Criando um novo arquivo de configuração
+  cat >/etc/network/interfaces.new <<EOF
+auto lo
+iface lo inet loopback
+
+# Bonding - Balanceamento 1
+auto bond0
+iface bond0 inet static
+    address $BOND0_CIDR
+    gateway 192.168.0.2
+    bond-slaves eno1 eno2
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate 1
+    comment Balanceamento 1
+
+# Bonding - Balanceamento 2
+auto bond1
+iface bond1 inet manual
+    bond-slaves eno3 eno4
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate 1
+    comment Balanceamento 2
+
+# Bonding - Cluster
+auto bond2
+iface bond2 inet static
+    address $BOND2_CIDR
+    bond-slaves enp68s0f0 enp68s0f1
+    bond-mode active-backup
+    bond-primary enp68s0f0
+    comment Cluster
+
+EOF
+  mv /etc/network/interfaces.new /etc/network/interfaces
+  systemctl restart networking
+  
+  if [[ "$HOSTNAME" == "pve01" ]]; then
+      BOND_IP="192.168.0.31/21"
+  elif [[ "$HOSTNAME" == "pve02" ]]; then
+      BOND_IP="192.168.0.32/21"
+  elif [[ "$HOSTNAME" == "pve03" ]]; then
+      BOND_IP="192.168.0.33/21"
+  else
+      echo "Hostname não reconhecido! Saindo..."
+      exit 1
+  fi
+
+  # Criando o script failover_bond.sh com os valores resolvidos
+  cat >/usr/local/bin/failover_bond.sh <<EOF
+#!/bin/bash
+
+# Definições
+BOND_PRIMARY="bond0"
+BOND_FAILOVER="bond1"
+TEST_IP="192.168.0.2"
+BOND_IP="$BOND_IP"
+GATEWAY="192.168.0.2"
+LOG_FILE="/var/log/bond_failover.log"
+
+# Testa conectividade no bond0
+ping -I \$BOND_PRIMARY -c 3 -W 2 \$TEST_IP > /dev/null 2>&1
+if [ \$? -ne 0 ]; then
+    echo "\$(date) - Falha detectada em bond0, ativando bond1 e alternando IP..." >> \$LOG_FILE
+
+    # Removendo IP e Gateway de bond0
+    ip addr del \$BOND_IP dev \$BOND_PRIMARY
+    ip route del default via \$GATEWAY dev \$BOND_PRIMARY
+    ip link set dev \$BOND_PRIMARY down
+
+    # Ativando bond1 com o mesmo IP e Gateway
+    ip link set dev \$BOND_FAILOVER up
+    ip addr add \$BOND_IP dev \$BOND_FAILOVER
+    ip route add default via \$GATEWAY dev \$BOND_FAILOVER
+else
+    # Se bond1 estiver ativo e bond0 recuperado, reverter configuração
+    bond1_status=\$(ip addr show \$BOND_FAILOVER | grep "\$BOND_IP")
+    if [ ! -z "\$bond1_status" ]; then
+        echo "\$(date) - Bond0 recuperado, restaurando IP..." >> \$LOG_FILE
+
+        # Removendo IP e Gateway de bond1
+        ip addr del \$BOND_IP dev \$BOND_FAILOVER
+        ip route del default via \$GATEWAY dev \$BOND_FAILOVER
+        ip link set dev \$BOND_FAILOVER down
+
+        # Reativando bond0 com o mesmo IP e Gateway
+        ip link set dev \$BOND_PRIMARY up
+        ip addr add \$BOND_IP dev \$BOND_PRIMARY
+        ip route add default via \$GATEWAY dev \$BOND_PRIMARY
+    else
+        echo "\$(date) - Bond0 ativo, mantendo configuração." >> \$LOG_FILE
+    fi
+fi
+EOF
+
+  chmod +x /usr/local/bin/failover_bond.sh
+  echo "*/1 * * * * /usr/local/bin/failover_bond.sh" | crontab -
+  msg_info "Configuração de bonding aplicada com sucesso no servidor $HOSTNAME!"
+
+  msg_ok "Configuração de bonding aplicada com sucesso!"
+}
+
+install_keepalive() {
+  msg_info "Instalando e configurando o KeepAlive..."
+  apt update && apt --fix-broken install -y && apt install -y keepalived
+  if [[ "$HOSTNAME" == "pve01" ]]; then
+      STATE="MASTER"
+      UNICAST_SRC_IP="192.168.0.31"
+      UNICAST_PEER1="192.168.0.32"
+      UNICAST_PEER2="192.168.0.33"
+   elif [[ "$HOSTNAME" == "pve02" ]]; then
+      STATE="BACKUP"
+      UNICAST_SRC_IP="192.168.0.32"
+      UNICAST_PEER1="192.168.0.31"
+      UNICAST_PEER2="192.168.0.33"
+   elif [[ "$HOSTNAME" == "pve03" ]]; then
+      STATE="BACKUP"
+      UNICAST_SRC_IP="192.168.0.33"
+      UNICAST_PEER1="192.168.0.31" 
+      UNICAST_PEER2="192.168.0.32"
+  else
+  fi
+  cat  >/etc/keepalived/keepalived.conf <<EOF
+vrrp_instance VI_1 {
+    state $STATE 
+    interface bond0
+    virtual_router_id 55
+    priority 100
+    advert_int 1
+    unicast_src_ip $UNICAST_SRC_IP
+    unicast_peer {
+        $UNICAST_PEER1
+        $UNICAST_PEER2
+    }
+    authentication {
+        auth_type PASS
+        auth_pass Dr753M0ç
+    }
+    virtual_ipaddress {
+        192.168.0.30/21
+    }
+}
+EOF
+
+  systemctl enable keepalived &>/dev/null
+  systemctl start keepalived &>/dev/null
+  msg_ok "KeepAlive instalado com sucesso."
+}
 # Execução das funções
 corrigir_repositorios
 echo " "
@@ -183,4 +342,9 @@ ocultar_avisos
 desabilitar_avisos_assinatura
 echo " "
 iDRAC7
+echo " "
+interfaces_bond
+echo " "
+install_keepalive
+echo " "
 reiniciar_sistema
