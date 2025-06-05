@@ -89,18 +89,17 @@ EOF
 # Função para desabilitar o aviso de assinatura
 desabilitar_avisos_assinatura() {
     msg_info "Removendo aviso de assinatura da interface web (no nag)..."
-    local JS_FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-
-    if [ -f "$JS_FILE" ]; then
-        cp "$JS_FILE" "${JS_FILE}.bak"
-
-        sed -i.bak -E "s/(!)?(data\.status\.subscription)/\2/" "$JS_FILE"
-        sed -i -E "s/Proxmox VE Subscription/Proxmox VE No-Subscription/" "$JS_FILE"
-
-        msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
-    else
-        msg_error "Arquivo JavaScript não encontrado: $JS_FILE"
-    fi
+    cat >/etc/apt/apt.conf.d/no-nag-script <<EOF
+DPkg::Post-Invoke {
+  "dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; \
+  if [ $? -eq 1 ]; then \
+    echo 'Removing subscription nag from UI...'; \
+    sed -i '/.*data\.status.*{/{s/!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; \
+  fi";
+};
+EOF
+apt --reinstall install proxmox-widget-toolkit &>/dev/null
+msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
 }
 
 
