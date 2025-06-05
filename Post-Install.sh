@@ -98,8 +98,10 @@ DPkg::Post-Invoke {
   fi";
 };
 EOF
-apt --reinstall install proxmox-widget-toolkit &>/dev/null
-msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
+    apt --reinstall install proxmox-widget-toolkit &>/dev/null
+    echo "DPkg::Post-Invoke { \"dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; if [ \$? -eq 1 ]; then { echo 'Removendo banner de assinatura do UI...'; sed -i '/data.status/{s/\!//;s/Active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; }; fi\"; };" > /etc/apt/apt.conf.d/no-nag-script
+    apt --reinstall install proxmox-widget-toolkit
+    msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
 }
 
 
@@ -154,10 +156,15 @@ iDRAC7() {
 
 # Execução das funções
 corrigir_repositorios
+echo " "
 desabilitar_pve_enterprise
+echo " "
 corrigir_repositorios_ceph
-desabilitar_avisos_assinatura
+echo " "
 atualizar_proxmox
+echo " "
 ocultar_avisos
+desabilitar_avisos_assinatura
+echo " "
 #iDRAC7
 reiniciar_sistema
