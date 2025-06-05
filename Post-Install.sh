@@ -1,5 +1,23 @@
 #!/bin/bash
 
+# Mensagens de status
+msg_info()   { echo -e "\033[36mℹ️\033[0m $1"; }
+msg_ok()     { echo -e "\033[32m✅\033[0m $1"; }
+msg_error()  { echo -e "\033[31m❌\033[0m $1"; }
+
+read -s -p "Digite a senha do iDRAC: " IDRAC_PASSWORD
+
+if [ -z "$IDRAC_PASSWORD" ]; then
+  msg_error "Erro: variável de ambiente IDRAC_PASSWORD não definida."
+  exit 1
+fi
+# Verificar se a CPU é Intel
+cpu_vendor=$(lscpu | grep -i 'Vendor ID' | awk '{print $3}')
+if ! echo "$cpu_vendor" | grep -qi 'intel'; then
+    msg_error "CPU não é Intel. Abortando."
+    exit 1
+fi
+
 # Backup do sources.list.d atual
 cp /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.bak 2>/dev/null
 # Comenta o repositório enterprise (se existir)
@@ -12,17 +30,6 @@ rm -f /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.bak 2>
 echo "deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
 echo "deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
 echo "deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
-
-# Mensagens de status
-msg_info()   { echo -e "\033[36mℹ️\033[0m $1"; }
-msg_ok()     { echo -e "\033[32m✅\033[0m $1"; }
-msg_error()  { echo -e "\033[31m❌\033[0m $1"; }
-# Verificar se a CPU é Intel
-cpu_vendor=$(lscpu | grep -i 'Vendor ID' | awk '{print $3}')
-if ! echo "$cpu_vendor" | grep -qi 'intel'; then
-    msg_error "CPU não é Intel. Abortando."
-    exit 1
-fi
 clear
 # Instalar iucode-tool (útil para carregamento de microcódigo manual)
 msg_info "Instalando dependência: iucode-tool..."
@@ -89,18 +96,18 @@ EOF
 # Função para desabilitar o aviso de assinatura
 desabilitar_avisos_assinatura() {
     msg_info "Removendo aviso de assinatura da interface web (no nag)..."
-    cat >/etc/apt/apt.conf.d/no-nag-script <<EOF
-DPkg::Post-Invoke {
-  "dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; \
-  if [ $? -eq 1 ]; then \
-    echo 'Removing subscription nag from UI...'; \
-    sed -i '/.*data\.status.*{/{s/!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; \
-  fi";
-};
-EOF
-    apt --reinstall install proxmox-widget-toolkit &>/dev/null
+    #cat >/etc/apt/apt.conf.d/no-nag-script <<EOF
+#DPkg::Post-Invoke {
+#  "dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; \
+#  if [ $? -eq 1 ]; then \
+#    echo 'Removing subscription nag from UI...'; \
+#    sed -i '/.*data\.status.*{/{s/!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; \
+#  fi";
+#};
+#EOF
+#    apt --reinstall install proxmox-widget-toolkit &>/dev/null
     echo "DPkg::Post-Invoke { \"dpkg -V proxmox-widget-toolkit | grep -q '/proxmoxlib\.js$'; if [ \$? -eq 1 ]; then { echo 'Removendo banner de assinatura do UI...'; sed -i '/data.status/{s/\!//;s/Active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; }; fi\"; };" > /etc/apt/apt.conf.d/no-nag-script
-    apt --reinstall install proxmox-widget-toolkit
+    apt --reinstall install proxmox-widget-toolkit &>/dev/null
     msg_ok "Aviso removido com sucesso (limpe o cache do navegador)."
 }
 
@@ -117,6 +124,7 @@ atualizar_proxmox() {
 reiniciar_sistema() {
     msg_info "Reiniciando o sistema..."
     history -c
+    cat /dev/null > ~/.bash_history
     reboot
 }
 
@@ -129,6 +137,7 @@ ocultar_avisos() {
 
 # Ajustar iDRAC7
 iDRAC7() {
+    msg_info "Instalando iDRAC-Tools"
     cd ~
     wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" -O Dell-iDRACTools-Web-LX.tar.gz "https://dl.dell.com/FOLDER09667202M/1/Dell-iDRACTools-Web-LX-11.1.0.0-5294_A00.tar.gz" &>/dev/null
     tar -xvf Dell-iDRACTools-Web-LX.tar.gz &>/dev/null
@@ -138,6 +147,7 @@ iDRAC7() {
     dpkg -i *.deb &>/dev/null
     rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+    msg_info "Atualizando iDRAC-Tools..."
     cd ~
     wget --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" -O Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz "https://dl.dell.com/FOLDER12236395M/1/Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz" &>/dev/null
     tar -xvf Dell-iDRACTools-Web-LX-11.3.0.0-609_A00.tar.gz &>/dev/null
@@ -146,12 +156,18 @@ iDRAC7() {
     dpkg -i *.deb &>/dev/null
     rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+    msg_info "Habilitando CLI 'racadm'"
     cd ~
     cd iDRACTools/racadm/UBUNTU22/x86_64
     alien srvadmin-*.rpm &>/dev/null
     dpkg -i *.deb &>/dev/null
     rm -f /usr/local/bin/racadm
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
+    cd ~
+    msg_ok "iDRAC instalada."
+    racadm set System.ServerOS.HostName $(hostname -s)
+    racadm set System.ServerOS.OSName "Proxmox VE $(pveversion | cut -d'/' -f2)"
+    racadm set iDRAC.Users.2.Password $IDRAC_PASSWORD
 }
 
 # Execução das funções
@@ -166,5 +182,5 @@ echo " "
 ocultar_avisos
 desabilitar_avisos_assinatura
 echo " "
-#iDRAC7
+iDRAC7
 reiniciar_sistema
