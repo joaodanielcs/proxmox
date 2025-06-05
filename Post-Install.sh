@@ -284,8 +284,11 @@ EOF
 }
 
 install_keepalive() {
-  msg_info "Instalando e configurando o KeepAlive..."
-  apt update && apt --fix-broken install -y && apt install -y keepalived
+  msg_info "Instalando o KeepAlive..."
+  apt update  &>/dev/null
+  apt --fix-broken install -y  &>/dev/null
+  apt install -y keepalived  &>/dev/null
+  msg_info "Configurando o KeepAlive..."
   if [[ "$HOSTNAME" == "pve01" ]]; then
       STATE="MASTER"
       UNICAST_SRC_IP="192.168.0.31"
