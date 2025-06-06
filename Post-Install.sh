@@ -185,35 +185,54 @@ interfaces_bond() {
 auto lo
 iface lo inet loopback
 
-# Bonding - Balanceamento 1
-auto bond0
-iface bond0 inet static
-    address $BOND0_CIDR
-    gateway 192.168.0.2
-    bond-slaves eno1 eno2
-    bond-mode 802.3ad
-    bond-miimon 100
-    bond-lacp-rate 1
-    comment Balanceamento 1
+auto eno1
+iface eno1 inet manual
 
-# Bonding - Balanceamento 2
+auto eno2
+iface eno2 inet manual
+
+auto eno3
+iface eno3 inet manual
+
+auto eno4
+iface eno4 inet manual
+
+auto enp68s0f0
+iface enp68s0f0 inet manual
+
+auto enp68s0f1
+iface enp68s0f1 inet manual
+
+auto bond0
+
+iface bond0 inet static
+        address $BOND0_CIDR
+        gateway 192.168.0.2
+        bond-slaves eno1 eno2
+        bond-miimon 100
+        bond-mode 802.3ad
+        bond-lacp-rate 1
+        comment Balanceamento 1
+#Balanceamento 1
+
 auto bond1
 iface bond1 inet manual
-    bond-slaves eno3 eno4
-    bond-mode 802.3ad
-    bond-miimon 100
-    bond-lacp-rate 1
-    comment Balanceamento 2
+        bond-slaves eno3 eno4
+        bond-miimon 100
+        bond-mode 802.3ad
+        bond-lacp-rate 1
+        comment Balanceamento 2
+#Balanceamento 2
 
-# Bonding - Cluster
 auto bond2
 iface bond2 inet static
-    address $BOND2_CIDR
-    bond-slaves enp68s0f0 enp68s0f1
-    bond-mode active-backup
-    bond-primary enp68s0f0
-    comment Cluster
-
+        address $BOND2_CIDR
+        bond-slaves enp68s0f0 enp68s0f1
+        bond-miimon 100
+        bond-mode active-backup
+        bond-primary enp68s0f0
+        comment Cluster
+#Cluster
 EOF
   mv /etc/network/interfaces.new /etc/network/interfaces
   systemctl restart networking
@@ -329,8 +348,8 @@ vrrp_instance VI_1 {
 }
 EOF
 
-  systemctl enable keepalived &>/dev/null
-  systemctl start keepalived &>/dev/null
+  #systemctl enable keepalived &>/dev/null
+  #systemctl start keepalived &>/dev/null
   msg_ok "KeepAlive instalado com sucesso."
 }
 # Execução das funções
