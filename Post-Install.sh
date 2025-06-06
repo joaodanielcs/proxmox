@@ -348,8 +348,8 @@ vrrp_instance VI_1 {
 }
 EOF
 
-  #systemctl enable keepalived &>/dev/null
-  #systemctl start keepalived &>/dev/null
+  systemctl enable keepalived &>/dev/null
+  systemctl start keepalived &>/dev/null
   msg_ok "KeepAlive instalado com sucesso."
 }
 # Execução das funções
