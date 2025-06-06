@@ -310,16 +310,19 @@ install_keepalive() {
   msg_info "Configurando o KeepAlive..."
   if [[ "$HOSTNAME" == "pve01" ]]; then
       STATE="MASTER"
+      PRIORITY="100"
       UNICAST_SRC_IP="192.168.0.31"
       UNICAST_PEER1="192.168.0.32"
       UNICAST_PEER2="192.168.0.33"
    elif [[ "$HOSTNAME" == "pve02" ]]; then
       STATE="BACKUP"
+      PRIORITY="99"
       UNICAST_SRC_IP="192.168.0.32"
       UNICAST_PEER1="192.168.0.31"
       UNICAST_PEER2="192.168.0.33"
    elif [[ "$HOSTNAME" == "pve03" ]]; then
       STATE="BACKUP"
+      PRIORITY="98"
       UNICAST_SRC_IP="192.168.0.33"
       UNICAST_PEER1="192.168.0.31" 
       UNICAST_PEER2="192.168.0.32"
@@ -331,7 +334,7 @@ vrrp_instance VI_1 {
     state $STATE 
     interface bond0
     virtual_router_id 55
-    priority 100
+    priority $PRIORITY
     advert_int 1
     unicast_src_ip $UNICAST_SRC_IP
     unicast_peer {
