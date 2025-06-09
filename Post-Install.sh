@@ -205,24 +205,13 @@ iface enp68s0f1 inet manual
 
 auto bond0
 
-iface bond0 inet static
-        address $BOND0_CIDR
-        gateway 192.168.0.2
-        bond-slaves eno1 eno2
+iface bond0 inet manual
+        bond-slaves eno1 eno2 eno3 eno4
         bond-miimon 100
         bond-mode 802.3ad
         bond-lacp-rate 1
-        comment Balanceamento 1
-#Balanceamento 1
-
-auto bond1
-iface bond1 inet manual
-        bond-slaves eno3 eno4
-        bond-miimon 100
-        bond-mode 802.3ad
-        bond-lacp-rate 1
-        comment Balanceamento 2
-#Balanceamento 2
+        comment Balanceamento
+#Balanceamento
 
 auto bond2
 iface bond2 inet static
@@ -231,75 +220,19 @@ iface bond2 inet static
         bond-miimon 100
         bond-mode active-backup
         bond-primary enp68s0f0
-        comment Cluster
 #Cluster
+
+auto vmbr0
+iface vmbr0 inet static
+        address $BOND0_CIDR
+        gateway 192.168.0.2
+        bridge-ports bond0
+        bridge-stp off
+        bridge-fd 0
 EOF
   mv /etc/network/interfaces.new /etc/network/interfaces
   systemctl restart networking
-  
-  if [[ "$HOSTNAME" == "pve01" ]]; then
-      BOND_IP="192.168.0.31/21"
-  elif [[ "$HOSTNAME" == "pve02" ]]; then
-      BOND_IP="192.168.0.32/21"
-  elif [[ "$HOSTNAME" == "pve03" ]]; then
-      BOND_IP="192.168.0.33/21"
-  else
-      echo "Hostname não reconhecido! Saindo..."
-      exit 1
-  fi
-
-  # Criando o script failover_bond.sh com os valores resolvidos
-  cat >/usr/local/bin/failover_bond.sh <<EOF
-#!/bin/bash
-
-# Definições
-BOND_PRIMARY="bond0"
-BOND_FAILOVER="bond1"
-TEST_IP="192.168.0.2"
-BOND_IP="$BOND_IP"
-GATEWAY="192.168.0.2"
-LOG_FILE="/var/log/bond_failover.log"
-
-# Testa conectividade no bond0
-ping -I \$BOND_PRIMARY -c 3 -W 2 \$TEST_IP > /dev/null 2>&1
-if [ \$? -ne 0 ]; then
-    echo "\$(date) - Falha detectada em bond0, ativando bond1 e alternando IP..." >> \$LOG_FILE
-
-    # Removendo IP e Gateway de bond0
-    ip addr del \$BOND_IP dev \$BOND_PRIMARY
-    ip route del default via \$GATEWAY dev \$BOND_PRIMARY
-    ip link set dev \$BOND_PRIMARY down
-
-    # Ativando bond1 com o mesmo IP e Gateway
-    ip link set dev \$BOND_FAILOVER up
-    ip addr add \$BOND_IP dev \$BOND_FAILOVER
-    ip route add default via \$GATEWAY dev \$BOND_FAILOVER
-else
-    # Se bond1 estiver ativo e bond0 recuperado, reverter configuração
-    bond1_status=\$(ip addr show \$BOND_FAILOVER | grep "\$BOND_IP")
-    if [ ! -z "\$bond1_status" ]; then
-        echo "\$(date) - Bond0 recuperado, restaurando IP..." >> \$LOG_FILE
-
-        # Removendo IP e Gateway de bond1
-        ip addr del \$BOND_IP dev \$BOND_FAILOVER
-        ip route del default via \$GATEWAY dev \$BOND_FAILOVER
-        ip link set dev \$BOND_FAILOVER down
-
-        # Reativando bond0 com o mesmo IP e Gateway
-        ip link set dev \$BOND_PRIMARY up
-        ip addr add \$BOND_IP dev \$BOND_PRIMARY
-        ip route add default via \$GATEWAY dev \$BOND_PRIMARY
-    else
-        echo "\$(date) - Bond0 ativo, mantendo configuração." >> \$LOG_FILE
-    fi
-fi
-EOF
-
-  chmod +x /usr/local/bin/failover_bond.sh
-  echo "*/1 * * * * /usr/local/bin/failover_bond.sh" | crontab -
-  msg_info "Configuração de bonding aplicada com sucesso no servidor $HOSTNAME!"
-
-  msg_ok "Configuração de bonding aplicada com sucesso!"
+  msg_ok "Configuração de bonding aplicada com sucesso no servidor $HOSTNAME!"
 }
 
 install_keepalive() {
@@ -332,7 +265,7 @@ install_keepalive() {
   cat  >/etc/keepalived/keepalived.conf <<EOF
 vrrp_instance VI_1 {
     state $STATE 
-    interface bond0
+    interface vmbr0
     virtual_router_id 55
     priority $PRIORITY
     advert_int 1
