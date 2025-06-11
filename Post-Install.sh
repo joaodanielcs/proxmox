@@ -85,36 +85,36 @@ desabilitar_pve_enterprise() {
 # Função para corrigir repositórios do Ceph
 corrigir_repositorios_ceph() {
     msg_info "Corrigindo repositórios do Ceph..."
-    cat >/etc/apt/sources.list.d/ceph.list <<EOF
+    cat > /etc/apt/sources.list.d/ceph.list <<EOF
 deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription
 deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription
 deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription
 EOF
-    apt update &>/dev/null
-    apt install uuid-runtime &>/dev/null
 
-    if [[ "$HOSTNAME" == "pve01" ]]; then
-          MON_IP="192.168.0.31"
-          MON_NET="192.168.0.31/21"
-       elif [[ "$HOSTNAME" == "pve02" ]]; then
-          MON_IP="192.168.0.32"
-          MON_NET="192.168.0.32/21"
-       elif [[ "$HOSTNAME" == "pve03" ]]; then
-          MON_IP="192.168.0.33"
-          MON_NET="192.168.0.33/21"
-       else
-          msg_error "Servidor com hostname errado."
-      fi
+
+    apt update &>/dev/null
+    if ! command -v uuidgen &>/dev/null; then
+        msg_info "Instalando uuid-runtime..."
+        apt install -y uuid-runtime &>/dev/null
+    fi
+
+    case "$HOSTNAME" in
+        pve01) MON_IP="192.168.0.31"; MON_NET="192.168.0.31/21" ;;
+        pve02) MON_IP="192.168.0.32"; MON_NET="192.168.0.32/21" ;;
+        pve03) MON_IP="192.168.0.33"; MON_NET="192.168.0.33/21" ;;
+    esac
+
       mkdir -p /etc/ceph
-      echo "[global]
+          cat > /etc/ceph/ceph.conf <<EOF
+[global]
 fsid = $(uuidgen)
 mon_initial_members = $(hostname)
-mon_host = $(hostname -I | awk '{print $1}')
+mon_host = $MON_IP
 public_network = $MON_NET
 
 [mon]
 mon-address = $MON_IP
-" > /etc/ceph/ceph.conf
+EOF
       chmod 644 /etc/ceph/ceph.conf
       chown ceph:ceph /etc/ceph/ceph.conf
       msg_ok "Repositórios do Ceph corrigidos."
