@@ -2,9 +2,23 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/joaodanielcs/proxmox/re
 
 #1. Criar ou inserir no cluster;
 
-#2. Instalar e configurar o CEPH;
+#2. Instalar o CEPH;
 
-#3. Shell:   systemctl enable keepalived &>/dev/null && systemctl start keepalived &>/dev/null 
+    # Info: Version: 19.2     Repository: No-Subscription
+
+    # instalation: y
+
+    # Configuration: Public: 192.168.... Cluster: 172.31.....
+
+    # Monitor: Manager > Create > seleciona o host... Monitor > Create > seleciona o host.... 
+
+    # CephFS: Metadata > Create > seleciona o host...
+
+    # OSD: Create OSD > Disk: Seleciona > Wall Disk: Seleciona o SSD
+
+    # Pools: (se não existir) Create > Name: Tank
+  
+#3. Shell:   systemctl enable keepalived &>/dev/null && systemctl start keepalived &>/dev/null && history -c
 
 Dica para o erro de multiplos IPs com o CEPH:Add commentMore actions
 
