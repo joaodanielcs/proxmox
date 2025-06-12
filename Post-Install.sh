@@ -250,6 +250,8 @@ EOF
 
   #systemctl enable keepalived &>/dev/null
   #systemctl start keepalived &>/dev/null
+  systemctl disable keepalived &>/dev/null
+  systemctl stop keepalived &>/dev/null
   msg_ok "KeepAlive instalado com sucesso."
 }
 # Execução das funções
