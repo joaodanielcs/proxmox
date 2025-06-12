@@ -26,16 +26,13 @@ sed -i 's|^deb https://enterprise.proxmox.com|#deb https://enterprise.proxmox.co
 echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
 # Remove repositórios Ceph enterprise se existirem
 rm -f /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.bak 2>/dev/null
-# Adiciona repositório livre (no-subscription)
-echo "deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
-echo "deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
-echo "deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription" > /etc/apt/sources.list.d/ceph.list
 clear
 # Instalar iucode-tool (útil para carregamento de microcódigo manual)
 msg_info "Instalando dependência: iucode-tool..."
 apt-get update -qq &>/dev/null
 apt-get install -y iucode-tool &>/dev/null
 msg_ok "iucode-tool instalado."
+echo " "
 # Buscar e instalar o pacote mais recente do microcódigo Intel
 msg_info "Buscando a versão mais recente do microcódigo Intel..."
 intel_pkg=$(curl -fsSL "https://ftp.debian.org/debian/pool/non-free-firmware/i/intel-microcode/" | \
@@ -51,12 +48,18 @@ wget -q "https://ftp.debian.org/debian/pool/non-free-firmware/i/intel-microcode/
 msg_info "Instalando o pacote..."
 dpkg -i "$intel_pkg" &>/dev/null
 msg_ok "Pacote instalado com sucesso."
-msg_info "Removendo o arquivo .deb baixado..."
+echo " "
 rm -f "$intel_pkg"
-msg_ok "Arquivo removido."
 msg_info "Reiniciando serviço de microcódigo..."
 systemctl restart microcode.service &>/dev/null || true
 msg_ok "Serviço reiniciado (se aplicável)."
+echo " "
+HOSTNAME=$(hostname)
+case "$HOSTNAME" in
+      pve01) SRV_IP="192.168.0.31"; SRV_NET="192.168.0.31/21"; BOND2_CIDR="172.31.163.1/28"; STATE="MASTER"; PRIORITY="100"; UNICAST_PEER1="192.168.0.32"; UNICAST_PEER2="192.168.0.33" ;;
+      pve02) SRV_IP="192.168.0.32"; SRV_NET="192.168.0.32/21"; BOND2_CIDR="172.31.163.2/28"; STATE="BACKUP"; PRIORITY="99"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.33" ;;
+      pve03) SRV_IP="192.168.0.33"; SRV_NET="192.168.0.33/21"; BOND2_CIDR="172.31.163.3/28"; STATE="BACKUP"; PRIORITY="98"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.32" ;;
+esac
 
 # Função para corrigir repositórios do Proxmox VE
 corrigir_repositorios() {
@@ -86,37 +89,8 @@ desabilitar_pve_enterprise() {
 corrigir_repositorios_ceph() {
     msg_info "Corrigindo repositórios do Ceph..."
     cat > /etc/apt/sources.list.d/ceph.list <<EOF
-deb http://download.proxmox.com/debian/ceph-reef bookworm no-subscription
-deb http://download.proxmox.com/debian/ceph-quincy bookworm no-subscription
 deb http://download.proxmox.com/debian/ceph-squid bookworm no-subscription
 EOF
-
-
-    apt update &>/dev/null
-    if ! command -v uuidgen &>/dev/null; then
-        msg_info "Instalando uuid-runtime..."
-        apt install -y uuid-runtime &>/dev/null
-    fi
-
-    case "$HOSTNAME" in
-        pve01) MON_IP="192.168.0.31"; MON_NET="192.168.0.31/21" ;;
-        pve02) MON_IP="192.168.0.32"; MON_NET="192.168.0.32/21" ;;
-        pve03) MON_IP="192.168.0.33"; MON_NET="192.168.0.33/21" ;;
-    esac
-
-      mkdir -p /etc/ceph
-          cat > /etc/ceph/ceph.conf <<EOF
-[global]
-fsid = $(uuidgen)
-mon_initial_members = $(hostname)
-mon_host = $MON_IP
-public_network = $MON_NET
-
-[mon]
-mon-address = $MON_IP
-EOF
-      chmod 644 /etc/ceph/ceph.conf
-      chown ceph:ceph /etc/ceph/ceph.conf
       msg_ok "Repositórios do Ceph corrigidos."
 }
 
@@ -187,26 +161,9 @@ iDRAC7() {
     racadm set iDRAC.Users.2.Password $IDRAC_PASSWORD
 }
 
-
 interfaces_bond() {
-  msg_info "Criando Interfaces bonding"
-  cp /etc/network/interfaces /etc/network/interfaces.bak
-  HOSTNAME=$(hostname)
-  # Definindo os valores de CIDR de acordo com o hostname
-  if [[ "$HOSTNAME" == "pve01" ]]; then
-      BOND0_CIDR="192.168.0.31/21"
-      BOND2_CIDR="172.31.163.1/28"
-  elif [[ "$HOSTNAME" == "pve02" ]]; then
-      BOND0_CIDR="192.168.0.32/21"
-      BOND2_CIDR="172.31.163.2/28"
-  elif [[ "$HOSTNAME" == "pve03" ]]; then
-      BOND0_CIDR="192.168.0.33/21"
-      BOND2_CIDR="172.31.163.3/28"
-  else
-      msg_error "Hostname não reconhecido! Saindo..."
-      exit 1
-  fi
-
+    msg_info "Criando Interfaces bonding"
+    cp /etc/network/interfaces /etc/network/interfaces.bak
   # Criando um novo arquivo de configuração
   cat >/etc/network/interfaces.new <<EOF
 auto lo
@@ -251,7 +208,7 @@ iface bond2 inet static
 
 auto vmbr0
 iface vmbr0 inet static
-        address $BOND0_CIDR
+        address $SRV_NET
         gateway 192.168.0.2
         bridge-ports bond0
         bridge-stp off
@@ -268,27 +225,7 @@ install_keepalive() {
   apt --fix-broken install -y  &>/dev/null
   apt install -y keepalived  &>/dev/null
   msg_info "Configurando o KeepAlive..."
-  if [[ "$HOSTNAME" == "pve01" ]]; then
-      STATE="MASTER"
-      PRIORITY="100"
-      UNICAST_SRC_IP="192.168.0.31"
-      UNICAST_PEER1="192.168.0.32"
-      UNICAST_PEER2="192.168.0.33"
-   elif [[ "$HOSTNAME" == "pve02" ]]; then
-      STATE="BACKUP"
-      PRIORITY="99"
-      UNICAST_SRC_IP="192.168.0.32"
-      UNICAST_PEER1="192.168.0.31"
-      UNICAST_PEER2="192.168.0.33"
-   elif [[ "$HOSTNAME" == "pve03" ]]; then
-      STATE="BACKUP"
-      PRIORITY="98"
-      UNICAST_SRC_IP="192.168.0.33"
-      UNICAST_PEER1="192.168.0.31" 
-      UNICAST_PEER2="192.168.0.32"
-  else
-      msg_error "Servidor com hostname errado."
-  fi
+
   cat  >/etc/keepalived/keepalived.conf <<EOF
 vrrp_instance VI_1 {
     state $STATE 
@@ -296,7 +233,7 @@ vrrp_instance VI_1 {
     virtual_router_id 55
     priority $PRIORITY
     advert_int 1
-    unicast_src_ip $UNICAST_SRC_IP
+    unicast_src_ip $SRV_IP
     unicast_peer {
         $UNICAST_PEER1
         $UNICAST_PEER2
@@ -311,8 +248,8 @@ vrrp_instance VI_1 {
 }
 EOF
 
-  systemctl enable keepalived &>/dev/null
-  systemctl start keepalived &>/dev/null
+  #systemctl enable keepalived &>/dev/null
+  #systemctl start keepalived &>/dev/null
   msg_ok "KeepAlive instalado com sucesso."
 }
 # Execução das funções
