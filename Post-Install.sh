@@ -279,5 +279,5 @@ interfaces_bond
 echo " "
 install_keepalive
 echo " "
-montar_NAS()
+montar_NAS
 reiniciar_sistema
