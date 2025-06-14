@@ -254,6 +254,12 @@ EOF
   systemctl stop keepalived &>/dev/null
   msg_ok "KeepAlive instalado com sucesso."
 }
+
+montar_NAS() {
+  mkdir -p /mnt/nas
+  echo "192.168.0.42:/nfs/Backups/PVE-Cluster /mnt/nas nfs defaults,_netdev 0 0" | tee -a /etc/fstab
+  systemctl daemon-reload
+}
 # Execução das funções
 corrigir_repositorios
 echo " "
@@ -272,4 +278,5 @@ interfaces_bond
 echo " "
 install_keepalive
 echo " "
+montar_NAS()
 reiniciar_sistema
