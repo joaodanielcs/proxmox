@@ -172,7 +172,7 @@ iDRAC7() {
         ipmitool mc setsysinfo system_name "$HOSTNAME_SHORT"
         ipmitool mc setsysinfo os_name "Proxmox VE "
         ipmitool mc setsysinfo delloem_os_version "$(pveversion | cut -d'/' -f2)"
-        ipmitool user set password 2 "$IDRAC_PASSWORD"
+        ipmitool user set password 2 "$IDRAC_PASSWORD" &>/dev/null
     fi
 }
 
