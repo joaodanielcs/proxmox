@@ -157,15 +157,20 @@ iDRAC7() {
     ln -s /opt/dell/srvadmin/bin/idracadm7 /usr/local/bin/racadm &>/dev/null
     cd ~
     msg_ok "iDRAC instalada."
-    racadm set System.ServerOS.HostName $(hostname -s)
-    racadm set System.ServerOS.OSName "Proxmox VE $(pveversion | cut -d'/' -f2)"
-    racadm set iDRAC.Users.2.Password $IDRAC_PASSWORD
-    apt install --fix-broken -y 
-    apt install ipmitool -y
-    ipmitool mc setsysinfo system_name "pve04"
-    ipmitool mc setsysinfo os_name "Proxmox VE 8.4.1"
+    HOSTNAME_SHORT=$(hostname -s)
 
-
+    if [[ "$HOSTNAME_SHORT" == "pve01" || "$HOSTNAME_SHORT" == "pve02" || "$HOSTNAME_SHORT" == "pve03" ]]; then
+        racadm set System.ServerOS.HostName "$HOSTNAME_SHORT"
+        racadm set System.ServerOS.OSName "Proxmox VE $(pveversion | cut -d'/' -f2)"
+        racadm set iDRAC.Users.2.Password "$IDRAC_PASSWORD"
+    else
+        apt install --fix-broken -y &>/dev/null
+        apt install ipmitool -y &>/dev/null
+        ipmitool mc setsysinfo system_name "$HOSTNAME_SHORT"
+        ipmitool mc setsysinfo os_name "Proxmox VE "
+        ipmitool mc setsysinfo delloem_os_version "$(pveversion | cut -d'/' -f2)"
+        ipmitool user set password 2 "$IDRAC_PASSWORD"
+    fi
 }
 
 interfaces_bond() {
