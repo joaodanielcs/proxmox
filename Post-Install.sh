@@ -177,13 +177,6 @@ iDRAC7() {
 }
 
 interfaces_bond() {
-    HOSTNAME_SHORT=$(hostname -s)
-    if [[ "$HOSTNAME_SHORT" == "pve01" || "$HOSTNAME_SHORT" == "pve02" || "$HOSTNAME_SHORT" == "pve03" ]]; then
-
-    else
-
-    
-    fi
     msg_info "Criando Interfaces bonding"
     cp /etc/network/interfaces /etc/network/interfaces.bak
   # Criando um novo arquivo de configuração
