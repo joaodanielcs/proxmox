@@ -56,9 +56,10 @@ msg_ok "Serviço reiniciado (se aplicável)."
 echo " "
 HOSTNAME=$(hostname)
 case "$HOSTNAME" in
-      pve01) SRV_IP="192.168.0.31"; SRV_NET="192.168.0.31/21"; BOND2_CIDR="172.31.163.1/28"; STATE="MASTER"; PRIORITY="100"; UNICAST_PEER1="192.168.0.32"; UNICAST_PEER2="192.168.0.33" ;;
-      pve02) SRV_IP="192.168.0.32"; SRV_NET="192.168.0.32/21"; BOND2_CIDR="172.31.163.2/28"; STATE="BACKUP"; PRIORITY="99"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.33" ;;
-      pve03) SRV_IP="192.168.0.33"; SRV_NET="192.168.0.33/21"; BOND2_CIDR="172.31.163.3/28"; STATE="BACKUP"; PRIORITY="98"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.32" ;;
+      pve01) SRV_IP="192.168.0.31"; SRV_NET="192.168.0.31/21"; BOND2_CIDR="172.31.163.1/28"; STATE="MASTER"; PRIORITY="100"; UNICAST_PEER1="192.168.0.32"; UNICAST_PEER2="192.168.0.33"; UNICAST_PEER3="192.168.0.34" ;;
+      pve02) SRV_IP="192.168.0.32"; SRV_NET="192.168.0.32/21"; BOND2_CIDR="172.31.163.2/28"; STATE="BACKUP"; PRIORITY="99"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.33"; UNICAST_PEER3="192.168.0.34" ;;
+      pve03) SRV_IP="192.168.0.33"; SRV_NET="192.168.0.33/21"; BOND2_CIDR="172.31.163.3/28"; STATE="BACKUP"; PRIORITY="98"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.32"; UNICAST_PEER3="192.168.0.34" ;;
+      pve04) SRV_IP="192.168.0.34"; SRV_NET="192.168.0.34/21"; BOND2_CIDR="172.31.163.4/28"; STATE="BACKUP"; PRIORITY="97"; UNICAST_PEER1="192.168.0.31"; UNICAST_PEER2="192.168.0.32"; UNICAST_PEER3="192.168.0.33" ;;
 esac
 
 # Função para corrigir repositórios do Proxmox VE
@@ -159,6 +160,12 @@ iDRAC7() {
     racadm set System.ServerOS.HostName $(hostname -s)
     racadm set System.ServerOS.OSName "Proxmox VE $(pveversion | cut -d'/' -f2)"
     racadm set iDRAC.Users.2.Password $IDRAC_PASSWORD
+    apt install --fix-broken -y 
+    apt install ipmitool -y
+    ipmitool mc setsysinfo system_name "pve04"
+    ipmitool mc setsysinfo os_name "Proxmox VE 8.4.1"
+
+
 }
 
 interfaces_bond() {
@@ -237,6 +244,7 @@ vrrp_instance VI_1 {
     unicast_peer {
         $UNICAST_PEER1
         $UNICAST_PEER2
+        $UNICAST_PEER3
     }
     authentication {
         auth_type PASS
