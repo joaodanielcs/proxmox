@@ -177,6 +177,13 @@ iDRAC7() {
 }
 
 interfaces_bond() {
+    HOSTNAME_SHORT=$(hostname -s)
+    if [[ "$HOSTNAME_SHORT" == "pve01" || "$HOSTNAME_SHORT" == "pve02" || "$HOSTNAME_SHORT" == "pve03" ]]; then
+
+    else
+
+    
+    fi
     msg_info "Criando Interfaces bonding"
     cp /etc/network/interfaces /etc/network/interfaces.bak
   # Criando um novo arquivo de configuração
@@ -215,10 +222,10 @@ iface bond0 inet manual
 auto bond2
 iface bond2 inet static
         address $BOND2_CIDR
-        bond-slaves enp68s0f0 enp68s0f1
+        bond-slaves $BOND_SLAVE
         bond-miimon 100
         bond-mode active-backup
-        bond-primary enp68s0f0
+        bond-primary $BOND-PRIMARY
 #Cluster
 
 auto vmbr0
