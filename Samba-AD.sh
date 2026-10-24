@@ -42,13 +42,10 @@ SYSVOL_ACL_CHECK_SECONDS="${SYSVOL_ACL_CHECK_SECONDS:-300}"
 DRS_WAIT_SECONDS="${DRS_WAIT_SECONDS:-180}"
 DNS_REPLICATION_WAIT_SECONDS="${DNS_REPLICATION_WAIT_SECONDS:-180}"
 
+ROOT_PASSWORD_ATTEMPTS="${ROOT_PASSWORD_ATTEMPTS:-3}"
+
 TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
 IFACE="${IFACE:-eth0}"
-
-# O script sempre TESTA os Pi-hole.
-# "yes" = falha nos Pi-hole também torna o exit code do script != 0.
-# "no"  = auditoria mostra a falha, mas não invalida a configuração Samba/AD.
-REQUIRE_PIHOLE_AUDIT="${REQUIRE_PIHOLE_AUDIT:-no}"
 
 # ============================================================
 # DERIVAÇÕES
@@ -57,22 +54,26 @@ REQUIRE_PIHOLE_AUDIT="${REQUIRE_PIHOLE_AUDIT:-no}"
 ROLE="${ROLE^^}"
 
 case "$ROLE" in
+
     PRIMARY)
         HOSTNAME="$PRIMARY_HOSTNAME"
         IP="$PRIMARY_IP"
         PEER_HOSTNAME="$SECONDARY_HOSTNAME"
         PEER_IP="$SECONDARY_IP"
         ;;
+
     SECONDARY)
         HOSTNAME="$SECONDARY_HOSTNAME"
         IP="$SECONDARY_IP"
         PEER_HOSTNAME="$PRIMARY_HOSTNAME"
         PEER_IP="$PRIMARY_IP"
         ;;
+
     *)
         echo "ERRO: ROLE deve ser PRIMARY ou SECONDARY"
         exit 1
         ;;
+
 esac
 
 FQDN="${HOSTNAME}.${DOMAIN}"
@@ -81,6 +82,8 @@ CIDR="${IP}/${PREFIX}"
 PRIMARY_FQDN="${PRIMARY_HOSTNAME}.${DOMAIN}"
 SECONDARY_FQDN="${SECONDARY_HOSTNAME}.${DOMAIN}"
 PEER_FQDN="${PEER_HOSTNAME}.${DOMAIN}"
+
+DOMAIN_DN="DC=${DOMAIN//./,DC=}"
 
 PTR_NAME="${IP##*.}"
 
@@ -96,10 +99,14 @@ SYSVOL="/var/lib/samba/sysvol"
 
 SYSVOL_KEY="/root/.ssh/id_ed25519_sysvol"
 
+DRS_ANALYZER="/tmp/drs-analyzer-${HOSTNAME}.py"
+
 ETAPA="INICIO"
 
 ADPASS=""
 PRIMARY_ROOT_PASS=""
+
+SSHPASS_TEMP=0
 
 # ============================================================
 # LOG
@@ -112,7 +119,7 @@ exec 3>&1 4>&2
 exec >"$LOG" 2>&1
 
 # ============================================================
-# FUNÇÕES GERAIS
+# FUNÇÕES
 # ============================================================
 
 status() {
@@ -125,20 +132,42 @@ prompt_secret() {
     local VALOR=""
 
     printf "%s" "$TEXTO" >/dev/tty
+
     IFS= read -r -s VALOR </dev/tty
+
     printf "\n" >/dev/tty
 
     printf -v "$VARIAVEL" '%s' "$VALOR"
 }
 
+remover_sshpass_temporario() {
+
+    if [[ "$SSHPASS_TEMP" == "1" ]]; then
+
+        export DEBIAN_FRONTEND=noninteractive
+
+        apt-get purge -y sshpass >/dev/null 2>&1 || true
+
+        unset DEBIAN_FRONTEND
+
+        SSHPASS_TEMP=0
+
+    fi
+}
+
 cleanup_secrets() {
+
     ADPASS=""
     PRIMARY_ROOT_PASS=""
 
     rm -f "$AUTH_FILE" 2>/dev/null || true
+    rm -f "$DRS_ANALYZER" 2>/dev/null || true
+
+    remover_sshpass_temporario
 }
 
 falha() {
+
     local RC=$?
 
     trap - ERR
@@ -160,7 +189,7 @@ falha() {
     echo "ULTIMAS LINHAS:"
     echo
 
-    tail -n 25 "$LOG" 2>/dev/null || true
+    tail -n 30 "$LOG" 2>/dev/null || true
 
     echo
     echo "============================================================"
@@ -185,9 +214,12 @@ ip -4 -o addr show "$IFACE" | grep -q "${CIDR}"
 ip route | grep -q "^default via ${GW}"
 
 if [[ -e "$SAMDB" ]]; then
+
     echo "A VM já possui ${SAMDB}."
     echo "Recrie a VM antes de executar este script."
+
     false
+
 fi
 
 cat >/etc/hosts <<EOF
@@ -245,6 +277,7 @@ PACOTES=(
     ldb-tools
     acl
     attr
+    python3
     python3-cryptography
     rsync
     tdb-tools
@@ -258,7 +291,7 @@ dpkg --configure -a
 
 unset DEBIAN_FRONTEND
 
-for CMD in samba-tool samba smbclient wbinfo rsync tdbbackup host dig flock ssh; do
+for CMD in samba-tool samba smbclient wbinfo rsync tdbbackup host dig flock ssh ldbsearch python3; do
     command -v "$CMD" >/dev/null
 done
 
@@ -339,12 +372,19 @@ if [[ "$ROLE" == "PRIMARY" ]]; then
 
     chmod 600 "$ADMIN_PASSWORD_FILE"
 
-    samba-tool domain provision --server-role=dc --realm="$REALM" --domain="$NETBIOS" --dns-backend=SAMBA_INTERNAL --host-ip="$IP" --use-rfc2307 --adminpass="$ADPASS"
+    samba-tool domain provision \
+        --server-role=dc \
+        --realm="$REALM" \
+        --domain="$NETBIOS" \
+        --dns-backend=SAMBA_INTERNAL \
+        --host-ip="$IP" \
+        --use-rfc2307 \
+        --adminpass="$ADPASS"
 
 fi
 
 # ============================================================
-# 4B. SECONDARY
+# 4B. SECONDARY - SSH PARA PRIMARY
 # ============================================================
 
 if [[ "$ROLE" == "SECONDARY" ]]; then
@@ -357,39 +397,120 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
     chmod 700 /root/.ssh
 
     if [[ ! -f "$SYSVOL_KEY" ]]; then
-        ssh-keygen -q -t ed25519 -N "" -f "$SYSVOL_KEY" -C "${HOSTNAME}-sysvol"
+
+        ssh-keygen -q \
+            -t ed25519 \
+            -N "" \
+            -f "$SYSVOL_KEY" \
+            -C "${HOSTNAME}-sysvol"
+
     fi
 
     ssh-keygen -R "$PRIMARY_IP" >/dev/null 2>&1 || true
     ssh-keygen -R "$PRIMARY_FQDN" >/dev/null 2>&1 || true
 
-    if ! ssh -i "$SYSVOL_KEY" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "root@${PRIMARY_IP}" true >/dev/null 2>&1; then
+    # ------------------------------------------------------------
+    # VERIFICAR SE A CHAVE JÁ FUNCIONA
+    # ------------------------------------------------------------
 
-        export DEBIAN_FRONTEND=noninteractive
+    if ! ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=accept-new \
+        "root@${PRIMARY_IP}" \
+        true >/dev/null 2>&1
+    then
 
-        apt-get install -y sshpass
+        # --------------------------------------------------------
+        # INSTALAR SSHPASS SOMENTE SE NECESSÁRIO
+        # --------------------------------------------------------
 
-        unset DEBIAN_FRONTEND
+        if ! command -v sshpass >/dev/null 2>&1; then
 
-        prompt_secret "Senha root de ${PRIMARY_HOSTNAME}: " PRIMARY_ROOT_PASS
+            export DEBIAN_FRONTEND=noninteractive
+
+            apt-get install -y sshpass
+
+            unset DEBIAN_FRONTEND
+
+            SSHPASS_TEMP=1
+
+        fi
 
         PUBKEY_B64="$(base64 -w0 <"${SYSVOL_KEY}.pub")"
 
-        SSHPASS="$PRIMARY_ROOT_PASS" sshpass -e ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@${PRIMARY_IP}" "set -e; mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; KEY=\$(printf '%s' '${PUBKEY_B64}' | base64 -d); grep -qxF \"\$KEY\" /root/.ssh/authorized_keys || printf '%s\n' \"\$KEY\" >> /root/.ssh/authorized_keys"
+        SSH_AUTH_OK=0
 
-        PRIMARY_ROOT_PASS=""
+        # --------------------------------------------------------
+        # ATÉ 3 TENTATIVAS DE SENHA ROOT
+        # --------------------------------------------------------
 
-        apt-get purge -y sshpass >/dev/null 2>&1 || true
+        for TENTATIVA in $(seq 1 "$ROOT_PASSWORD_ATTEMPTS"); do
+
+            prompt_secret "Senha root de ${PRIMARY_HOSTNAME}: " PRIMARY_ROOT_PASS
+
+            set +e
+
+            SSHPASS="$PRIMARY_ROOT_PASS" sshpass -e ssh \
+                -o ConnectTimeout=10 \
+                -o StrictHostKeyChecking=accept-new \
+                "root@${PRIMARY_IP}" \
+                "set -Eeuo pipefail; mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; KEY=\$(printf '%s' '${PUBKEY_B64}' | base64 -d); grep -qxF \"\$KEY\" /root/.ssh/authorized_keys || printf '%s\n' \"\$KEY\" >> /root/.ssh/authorized_keys" \
+                >/dev/null 2>&1
+
+            SSHPASS_RC=$?
+
+            set -e
+
+            PRIMARY_ROOT_PASS=""
+
+            if [[ "$SSHPASS_RC" == "0" ]]; then
+
+                SSH_AUTH_OK=1
+                break
+
+            fi
+
+            if [[ "$TENTATIVA" -lt "$ROOT_PASSWORD_ATTEMPTS" ]]; then
+
+                printf "Senha incorreta ou login root recusado. Tente novamente.\n\n" >/dev/tty
+
+            fi
+
+        done
+
+        if [[ "$SSH_AUTH_OK" != "1" ]]; then
+
+            echo "Falha de autenticação root em ${PRIMARY_HOSTNAME} após ${ROOT_PASSWORD_ATTEMPTS} tentativas."
+
+            false
+
+        fi
+
+        remover_sshpass_temporario
 
     fi
 
-    ssh -i "$SYSVOL_KEY" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes "root@${PRIMARY_IP}" true
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=yes \
+        "root@${PRIMARY_IP}" \
+        true
 
-    # ------------------------------------------------------------
+    # ============================================================
     # GARANTIR PRÉ-REQUISITOS NO PRIMARY
-    # ------------------------------------------------------------
+    # ============================================================
 
-    ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" '
+    ETAPA="PREPARAR_DEPENDENCIAS_PRIMARY"
+
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        "root@${PRIMARY_IP}" \
+        '
 set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -399,10 +520,13 @@ NEED=0
 command -v rsync >/dev/null 2>&1 || NEED=1
 command -v tdbbackup >/dev/null 2>&1 || NEED=1
 command -v flock >/dev/null 2>&1 || NEED=1
+command -v ldbsearch >/dev/null 2>&1 || NEED=1
 
 if [[ "$NEED" == "1" ]]; then
+
     apt-get update
-    apt-get install -y rsync tdb-tools util-linux
+    apt-get install -y rsync tdb-tools util-linux ldb-tools
+
 fi
 
 unset DEBIAN_FRONTEND
@@ -410,6 +534,7 @@ unset DEBIAN_FRONTEND
 command -v rsync >/dev/null
 command -v tdbbackup >/dev/null
 command -v flock >/dev/null
+command -v ldbsearch >/dev/null
 
 test -f /var/lib/samba/private/idmap.ldb
 test -d /var/lib/samba/sysvol
@@ -417,14 +542,83 @@ test -d /var/lib/samba/sysvol
 systemctl is-active --quiet samba-ad-dc
 '
 
-    # ------------------------------------------------------------
-    # OBTER CREDENCIAL DOMAIN ADMIN
-    # ------------------------------------------------------------
+    # ============================================================
+    # REMOVER METADADOS ANTIGOS DO MESMO SECONDARY
+    #
+    # ESTA VM É LIMPA E AINDA NÃO ENTROU NO DOMÍNIO.
+    # SE O PRIMARY AINDA POSSUI UM OBJETO ATIVO COM ESSE NOME,
+    # ELE PERTENCE A UMA INSTALAÇÃO ANTERIOR.
+    # ============================================================
 
-    ADPASS="$(ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "cat '${ADMIN_PASSWORD_FILE}'" 2>/dev/null || true)"
+    ETAPA="LIMPAR_METADATA_SECONDARY_ANTIGO"
+
+    SECONDARY_SAM="${SECONDARY_HOSTNAME^^}\$"
+
+    set +e
+
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        "root@${PRIMARY_IP}" \
+        "ldbsearch -H '${SAMDB}' -b 'OU=Domain Controllers,${DOMAIN_DN}' '(sAMAccountName=${SECONDARY_SAM})' dn 2>/dev/null | grep -q '^dn:'"
+
+    OLD_DC_RC=$?
+
+    set -e
+
+    if [[ "$OLD_DC_RC" == "0" ]]; then
+
+        status "4/10" "Removendo metadados antigos de ${SECONDARY_HOSTNAME}"
+
+        ssh \
+            -i "$SYSVOL_KEY" \
+            -o BatchMode=yes \
+            "root@${PRIMARY_IP}" \
+            "samba-tool domain demote --remove-other-dead-server='${SECONDARY_HOSTNAME}'"
+
+        sleep 5
+
+        set +e
+
+        ssh \
+            -i "$SYSVOL_KEY" \
+            -o BatchMode=yes \
+            "root@${PRIMARY_IP}" \
+            "ldbsearch -H '${SAMDB}' -b 'OU=Domain Controllers,${DOMAIN_DN}' '(sAMAccountName=${SECONDARY_SAM})' dn 2>/dev/null | grep -q '^dn:'"
+
+        OLD_DC_STILL_EXISTS=$?
+
+        set -e
+
+        if [[ "$OLD_DC_STILL_EXISTS" == "0" ]]; then
+
+            echo "Metadados ativos antigos de ${SECONDARY_HOSTNAME} ainda existem no PRIMARY."
+
+            false
+
+        fi
+
+    fi
+
+    # ============================================================
+    # OBTER SENHA DO ADMINISTRATOR
+    # ============================================================
+
+    ETAPA="OBTER_CREDENCIAL_AD"
+
+    ADPASS="$(
+        ssh \
+            -i "$SYSVOL_KEY" \
+            -o BatchMode=yes \
+            "root@${PRIMARY_IP}" \
+            "cat '${ADMIN_PASSWORD_FILE}'" \
+            2>/dev/null || true
+    )"
 
     if [[ -z "$ADPASS" ]]; then
+
         prompt_secret "Senha Administrator do domínio: " ADPASS
+
     fi
 
     [[ -n "$ADPASS" ]]
@@ -439,11 +633,19 @@ EOF
 
     chmod 600 "$AUTH_FILE"
 
+    # ============================================================
+    # JOIN
+    # ============================================================
+
     ETAPA="JOIN_SECONDARY"
 
     status "5/10" "Ingressando ${HOSTNAME} como DC adicional"
 
-    samba-tool domain join "$DOMAIN" DC -A "$AUTH_FILE" --dns-backend=SAMBA_INTERNAL
+    samba-tool domain join \
+        "$DOMAIN" \
+        DC \
+        -A "$AUTH_FILE" \
+        --dns-backend=SAMBA_INTERNAL
 
 fi
 
@@ -482,6 +684,7 @@ for line in lines:
         continue
 
     if global_section and s.startswith("[") and s.endswith("]"):
+
         if not gravado:
             saida.append(f"\tdns forwarder = {forwarders}")
             gravado = True
@@ -489,6 +692,7 @@ for line in lines:
         global_section = False
 
     if global_section and s.startswith("dns forwarder"):
+
         if not gravado:
             saida.append(f"\tdns forwarder = {forwarders}")
             gravado = True
@@ -522,33 +726,51 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
     REMOTE_IDMAP="${IDMAP}.setecsync"
     LOCAL_IDMAP="/root/idmap.ldb.setecsync"
 
-    ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "rm -f '${REMOTE_IDMAP}'; tdbbackup -s .setecsync '${IDMAP}'; test -s '${REMOTE_IDMAP}'"
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        "root@${PRIMARY_IP}" \
+        "rm -f '${REMOTE_IDMAP}'; tdbbackup -s .setecsync '${IDMAP}'; test -s '${REMOTE_IDMAP}'"
 
-    rsync -a -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" "root@${PRIMARY_IP}:${REMOTE_IDMAP}" "$LOCAL_IDMAP"
+    rsync \
+        -a \
+        -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+        "root@${PRIMARY_IP}:${REMOTE_IDMAP}" \
+        "$LOCAL_IDMAP"
 
-    ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "rm -f '${REMOTE_IDMAP}'"
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        "root@${PRIMARY_IP}" \
+        "rm -f '${REMOTE_IDMAP}'"
 
     test -s "$LOCAL_IDMAP"
 
-    install -o root -g root -m 600 "$LOCAL_IDMAP" "$IDMAP"
+    install \
+        -o root \
+        -g root \
+        -m 600 \
+        "$LOCAL_IDMAP" \
+        "$IDMAP"
 
     rm -f "$LOCAL_IDMAP"
 
-    rsync -aAXH --numeric-ids --delete --delay-updates -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" "root@${PRIMARY_IP}:${SYSVOL}/" "${SYSVOL}/"
+    rsync \
+        -aAXH \
+        --numeric-ids \
+        --delete \
+        --delay-updates \
+        -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+        "root@${PRIMARY_IP}:${SYSVOL}/" \
+        "${SYSVOL}/"
 
 fi
 
 # ============================================================
-# INICIAR SAMBA
+# DNS LOCAL DO DC
 # ============================================================
 
-ETAPA="INICIAR_SAMBA"
-
-if [[ "$ROLE" == "PRIMARY" ]]; then
-    status "6/10" "Iniciando Samba AD DC"
-else
-    status "8/10" "Iniciando Samba AD DC"
-fi
+ETAPA="CONFIGURAR_DNS_LOCAL"
 
 if [[ "$ROLE" == "PRIMARY" ]]; then
 
@@ -568,6 +790,18 @@ EOF
 fi
 
 chmod 644 /etc/resolv.conf
+
+# ============================================================
+# INICIAR SAMBA
+# ============================================================
+
+ETAPA="INICIAR_SAMBA"
+
+if [[ "$ROLE" == "PRIMARY" ]]; then
+    status "6/10" "Iniciando Samba AD DC"
+else
+    status "8/10" "Iniciando Samba AD DC"
+fi
 
 systemctl unmask samba-ad-dc 2>/dev/null || true
 
@@ -607,12 +841,38 @@ ETAPA="DNS_REVERSO"
 
 DNS_ADMIN_SERVER="$PRIMARY_IP"
 
-if ! samba-tool dns zonelist "$DNS_ADMIN_SERVER" -A "$AUTH_FILE" 2>/dev/null | grep -qi "$REVERSE_ZONE"; then
-    samba-tool dns zonecreate "$DNS_ADMIN_SERVER" "$REVERSE_ZONE" -A "$AUTH_FILE"
+if ! samba-tool dns zonelist \
+    "$DNS_ADMIN_SERVER" \
+    -A "$AUTH_FILE" \
+    2>/dev/null |
+    grep -qi "$REVERSE_ZONE"
+then
+
+    samba-tool dns zonecreate \
+        "$DNS_ADMIN_SERVER" \
+        "$REVERSE_ZONE" \
+        -A "$AUTH_FILE"
+
 fi
 
-if ! samba-tool dns query "$DNS_ADMIN_SERVER" "$REVERSE_ZONE" "$PTR_NAME" PTR -A "$AUTH_FILE" 2>/dev/null | grep -qi "$FQDN"; then
-    samba-tool dns add "$DNS_ADMIN_SERVER" "$REVERSE_ZONE" "$PTR_NAME" PTR "$FQDN" -A "$AUTH_FILE"
+if ! samba-tool dns query \
+    "$DNS_ADMIN_SERVER" \
+    "$REVERSE_ZONE" \
+    "$PTR_NAME" \
+    PTR \
+    -A "$AUTH_FILE" \
+    2>/dev/null |
+    grep -qi "$FQDN"
+then
+
+    samba-tool dns add \
+        "$DNS_ADMIN_SERVER" \
+        "$REVERSE_ZONE" \
+        "$PTR_NAME" \
+        PTR \
+        "$FQDN" \
+        -A "$AUTH_FILE"
+
 fi
 
 # ============================================================
@@ -631,11 +891,14 @@ if [[ "$ROLE" == "PRIMARY" ]]; then
 set -Eeuo pipefail
 
 exec 9>/run/lock/samba-sysvol-acl-check.lock
+
 flock -n 9 || exit 0
 
 if ! samba-tool ntacl sysvolcheck >/dev/null 2>&1; then
+
     samba-tool ntacl sysvolreset >/dev/null
     samba-tool ntacl sysvolcheck >/dev/null
+
 fi
 EOF
 
@@ -686,12 +949,11 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
     net cache flush 2>/dev/null || true
 
     samba-tool ntacl sysvolreset
-
     samba-tool ntacl sysvolcheck
 
-    # ------------------------------------------------------------
+    # ========================================================
     # SYSVOL
-    # ------------------------------------------------------------
+    # ========================================================
 
     cat >/usr/local/sbin/samba-sysvol-sync <<EOF
 #!/usr/bin/env bash
@@ -699,11 +961,29 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
 set -Eeuo pipefail
 
 exec 9>/run/lock/samba-sysvol-sync.lock
+
 flock -n 9 || exit 0
 
-ssh -i "${SYSVOL_KEY}" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes "root@${PRIMARY_IP}" true >/dev/null 2>&1 || exit 0
+ssh \
+    -i "${SYSVOL_KEY}" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=yes \
+    "root@${PRIMARY_IP}" \
+    true >/dev/null 2>&1 || exit 0
 
-CHANGES="\$(rsync -aAXH --numeric-ids --delete-delay --delay-updates --itemize-changes --timeout=30 -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes" "root@${PRIMARY_IP}:${SYSVOL}/" "${SYSVOL}/")"
+CHANGES="\$(
+    rsync \
+        -aAXH \
+        --numeric-ids \
+        --delete-delay \
+        --delay-updates \
+        --itemize-changes \
+        --timeout=30 \
+        -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes" \
+        "root@${PRIMARY_IP}:${SYSVOL}/" \
+        "${SYSVOL}/"
+)"
 
 if [[ -n "\$CHANGES" ]]; then
     samba-tool ntacl sysvolreset >/dev/null
@@ -739,9 +1019,9 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-    # ------------------------------------------------------------
+    # ========================================================
     # IDMAP
-    # ------------------------------------------------------------
+    # ========================================================
 
     cat >/usr/local/sbin/samba-idmap-sync <<EOF
 #!/usr/bin/env bash
@@ -749,18 +1029,37 @@ EOF
 set -Eeuo pipefail
 
 exec 9>/run/lock/samba-idmap-sync.lock
+
 flock -n 9 || exit 0
 
-ssh -i "${SYSVOL_KEY}" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes "root@${PRIMARY_IP}" true >/dev/null 2>&1 || exit 0
+ssh \
+    -i "${SYSVOL_KEY}" \
+    -o BatchMode=yes \
+    -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=yes \
+    "root@${PRIMARY_IP}" \
+    true >/dev/null 2>&1 || exit 0
 
 REMOTE="${IDMAP}.setecsync"
 LOCAL="/root/idmap.ldb.setecsync"
 
-ssh -i "${SYSVOL_KEY}" -o BatchMode=yes "root@${PRIMARY_IP}" "rm -f '\${REMOTE}'; tdbbackup -s .setecsync '${IDMAP}'; test -s '\${REMOTE}'"
+ssh \
+    -i "${SYSVOL_KEY}" \
+    -o BatchMode=yes \
+    "root@${PRIMARY_IP}" \
+    "rm -f '\${REMOTE}'; tdbbackup -s .setecsync '${IDMAP}'; test -s '\${REMOTE}'"
 
-rsync -a -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" "root@${PRIMARY_IP}:\${REMOTE}" "\${LOCAL}"
+rsync \
+    -a \
+    -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+    "root@${PRIMARY_IP}:\${REMOTE}" \
+    "\${LOCAL}"
 
-ssh -i "${SYSVOL_KEY}" -o BatchMode=yes "root@${PRIMARY_IP}" "rm -f '\${REMOTE}'"
+ssh \
+    -i "${SYSVOL_KEY}" \
+    -o BatchMode=yes \
+    "root@${PRIMARY_IP}" \
+    "rm -f '\${REMOTE}'"
 
 test -s "\${LOCAL}"
 
@@ -768,13 +1067,20 @@ SOURCE_HASH="\$(sha256sum "\${LOCAL}" | awk '{print \$1}')"
 LOCAL_HASH="\$(sha256sum "${IDMAP}" | awk '{print \$1}')"
 
 if [[ "\$SOURCE_HASH" == "\$LOCAL_HASH" ]]; then
+
     rm -f "\${LOCAL}"
     exit 0
+
 fi
 
 systemctl stop samba-ad-dc
 
-install -o root -g root -m 600 "\${LOCAL}" "${IDMAP}"
+install \
+    -o root \
+    -g root \
+    -m 600 \
+    "\${LOCAL}" \
+    "${IDMAP}"
 
 rm -f "\${LOCAL}"
 
@@ -822,13 +1128,20 @@ EOF
 
     systemctl start samba-sysvol-sync.service
 
-    # Primary passa a conhecer o Secondary como DNS alternativo.
-    ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "printf '%s\n' 'search ${DOMAIN}' 'nameserver ${PRIMARY_IP}' 'nameserver ${SECONDARY_IP}' > /etc/resolv.conf"
+    # ========================================================
+    # PRIMARY PASSA A USAR SECONDARY COMO DNS ALTERNATIVO
+    # ========================================================
+
+    ssh \
+        -i "$SYSVOL_KEY" \
+        -o BatchMode=yes \
+        "root@${PRIMARY_IP}" \
+        "printf '%s\n' 'search ${DOMAIN}' 'nameserver ${PRIMARY_IP}' 'nameserver ${SECONDARY_IP}' > /etc/resolv.conf"
 
 fi
 
 # ============================================================
-# AGUARDAR REPLICAÇÃO DNS NATURAL NO SECONDARY
+# SECONDARY - AGUARDAR DNS REPLICAR NATURALMENTE
 # ============================================================
 
 if [[ "$ROLE" == "SECONDARY" ]]; then
@@ -840,19 +1153,69 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
 
     while (( WAITED < DNS_REPLICATION_WAIT_SECONDS )); do
 
-        AD1_LOCAL="$(dig +time=2 +tries=1 +short @127.0.0.1 A "$PRIMARY_FQDN" | head -1 || true)"
-        AD2_LOCAL="$(dig +time=2 +tries=1 +short @127.0.0.1 A "$SECONDARY_FQDN" | head -1 || true)"
-        PTR1_LOCAL="$(dig +time=2 +tries=1 +short @127.0.0.1 -x "$PRIMARY_IP" | sed 's/\.$//' | head -1 || true)"
-        PTR2_LOCAL="$(dig +time=2 +tries=1 +short @127.0.0.1 -x "$SECONDARY_IP" | sed 's/\.$//' | head -1 || true)"
+        AD1_LOCAL="$(
+            dig \
+                +time=2 \
+                +tries=1 \
+                +short \
+                @127.0.0.1 \
+                A \
+                "$PRIMARY_FQDN" |
+            head -1 || true
+        )"
 
-        LDAP_LOCAL="$(dig +time=2 +tries=1 +short @127.0.0.1 SRV "_ldap._tcp.dc._msdcs.${DOMAIN}" || true)"
+        AD2_LOCAL="$(
+            dig \
+                +time=2 \
+                +tries=1 \
+                +short \
+                @127.0.0.1 \
+                A \
+                "$SECONDARY_FQDN" |
+            head -1 || true
+        )"
+
+        PTR1_LOCAL="$(
+            dig \
+                +time=2 \
+                +tries=1 \
+                +short \
+                @127.0.0.1 \
+                -x \
+                "$PRIMARY_IP" |
+            sed 's/\.$//' |
+            head -1 || true
+        )"
+
+        PTR2_LOCAL="$(
+            dig \
+                +time=2 \
+                +tries=1 \
+                +short \
+                @127.0.0.1 \
+                -x \
+                "$SECONDARY_IP" |
+            sed 's/\.$//' |
+            head -1 || true
+        )"
+
+        LDAP_LOCAL="$(
+            dig \
+                +time=2 \
+                +tries=1 \
+                +short \
+                @127.0.0.1 \
+                SRV \
+                "_ldap._tcp.dc._msdcs.${DOMAIN}" || true
+        )"
 
         if [[ "$AD1_LOCAL" == "$PRIMARY_IP" &&
               "$AD2_LOCAL" == "$SECONDARY_IP" &&
               "${PTR1_LOCAL,,}" == "${PRIMARY_FQDN,,}" &&
               "${PTR2_LOCAL,,}" == "${SECONDARY_FQDN,,}" ]] &&
            grep -qi "${PRIMARY_FQDN}\.$" <<<"$LDAP_LOCAL" &&
-           grep -qi "${SECONDARY_FQDN}\.$" <<<"$LDAP_LOCAL"; then
+           grep -qi "${SECONDARY_FQDN}\.$" <<<"$LDAP_LOCAL"
+        then
 
             DNS_REPLICATION_OK=1
             break
@@ -860,6 +1223,7 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
         fi
 
         sleep 5
+
         WAITED=$((WAITED + 5))
 
     done
@@ -869,7 +1233,112 @@ if [[ "$ROLE" == "SECONDARY" ]]; then
 fi
 
 # ============================================================
-# 10. AUDITORIA REAL PÓS-CONFIGURAÇÃO
+# CRIAR ANALISADOR DRS JSON
+# ============================================================
+
+cat >"$DRS_ANALYZER" <<'PY'
+#!/usr/bin/env python3
+
+import json
+import sys
+
+peer = sys.argv[1].lower()
+
+raw = sys.stdin.read()
+
+try:
+    data = json.loads(raw)
+except Exception as exc:
+    print(f"ERRO|json_invalido={exc}")
+    sys.exit(0)
+
+
+def is_deleted(record):
+    value = record.get("is deleted", record.get("is_deleted", False))
+
+    if value is True:
+        return True
+
+    return str(value).strip().lower() == "true"
+
+
+def is_peer(record):
+    try:
+        blob = json.dumps(record).lower()
+    except Exception:
+        blob = str(record).lower()
+
+    return peer in blob
+
+
+def number(value):
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def healthy(record):
+    failures = number(record.get("consecutive failures", 0))
+
+    if failures != 0:
+        return False
+
+    state = record.get("last attempt state", None)
+
+    if isinstance(state, (list, tuple)) and state:
+        try:
+            if int(state[0]) != 0:
+                return False
+        except Exception:
+            pass
+
+    elif isinstance(state, int):
+
+        if state != 0:
+            return False
+
+    message = str(record.get("last attempt message", "")).strip().lower()
+
+    if message and "successful" not in message:
+        return False
+
+    return True
+
+
+reps_from = [
+    record
+    for record in data.get("repsFrom", [])
+    if not is_deleted(record) and is_peer(record)
+]
+
+reps_to = [
+    record
+    for record in data.get("repsTo", [])
+    if not is_deleted(record) and is_peer(record)
+]
+
+records = reps_from + reps_to
+
+failed = [record for record in records if not healthy(record)]
+
+status = (
+    "OK"
+    if reps_from and reps_to and not failed
+    else "ERRO"
+)
+
+print(
+    f"{status}|from={len(reps_from)} "
+    f"to={len(reps_to)} "
+    f"failures={len(failed)}"
+)
+PY
+
+chmod 700 "$DRS_ANALYZER"
+
+# ============================================================
+# 10. AUDITORIA REAL
 # ============================================================
 
 ETAPA="AUDITORIA_FINAL"
@@ -883,34 +1352,64 @@ declare -a CORE_FAILURES=()
 declare -a PIHOLE_FAILURES=()
 
 audit_core() {
+
     local LABEL="$1"
     local EXPECTED="$2"
     local DETECTED="$3"
     local OK="$4"
+
     local LINE=""
 
     if [[ "$OK" == "1" ]]; then
-        printf -v LINE "%-30s OK   | esperado: %-38s | detectado: %s" "$LABEL" "$EXPECTED" "${DETECTED:-<vazio>}"
+
+        printf -v LINE \
+            "%-30s OK   | esperado: %-38s | detectado: %s" \
+            "$LABEL" \
+            "$EXPECTED" \
+            "${DETECTED:-<vazio>}"
+
     else
-        printf -v LINE "%-30s ERRO | esperado: %-38s | detectado: %s" "$LABEL" "$EXPECTED" "${DETECTED:-<vazio>}"
+
+        printf -v LINE \
+            "%-30s ERRO | esperado: %-38s | detectado: %s" \
+            "$LABEL" \
+            "$EXPECTED" \
+            "${DETECTED:-<vazio>}"
+
         CORE_FAILURES+=("$LABEL")
+
     fi
 
     CORE_REPORT+=("$LINE")
 }
 
 audit_pihole() {
+
     local LABEL="$1"
     local EXPECTED="$2"
     local DETECTED="$3"
     local OK="$4"
+
     local LINE=""
 
     if [[ "$OK" == "1" ]]; then
-        printf -v LINE "%-30s OK   | esperado: %-38s | detectado: %s" "$LABEL" "$EXPECTED" "${DETECTED:-<vazio>}"
+
+        printf -v LINE \
+            "%-30s OK   | esperado: %-38s | detectado: %s" \
+            "$LABEL" \
+            "$EXPECTED" \
+            "${DETECTED:-<vazio>}"
+
     else
-        printf -v LINE "%-30s ERRO | esperado: %-38s | detectado: %s" "$LABEL" "$EXPECTED" "${DETECTED:-<vazio>}"
+
+        printf -v LINE \
+            "%-30s ERRO | esperado: %-38s | detectado: %s" \
+            "$LABEL" \
+            "$EXPECTED" \
+            "${DETECTED:-<vazio>}"
+
         PIHOLE_FAILURES+=("$LABEL")
+
     fi
 
     PIHOLE_REPORT+=("$LINE")
@@ -923,97 +1422,246 @@ audit_pihole() {
 DETECTED_HOSTNAME="$(hostname)"
 DETECTED_FQDN="$(hostname -f)"
 
-DETECTED_IP="$(ip -4 -o addr show "$IFACE" | awk '{print $4; exit}')"
-DETECTED_GW="$(ip route show default | awk '{print $3; exit}')"
+DETECTED_IP="$(
+    ip -4 -o addr show "$IFACE" |
+    awk '{print $4; exit}'
+)"
+
+DETECTED_GW="$(
+    ip route show default |
+    awk '{print $3; exit}'
+)"
 
 [[ "$DETECTED_HOSTNAME" == "$HOSTNAME" ]] && OK=1 || OK=0
-audit_core "HOSTNAME" "$HOSTNAME" "$DETECTED_HOSTNAME" "$OK"
+
+audit_core \
+    "HOSTNAME" \
+    "$HOSTNAME" \
+    "$DETECTED_HOSTNAME" \
+    "$OK"
 
 [[ "$DETECTED_FQDN" == "$FQDN" ]] && OK=1 || OK=0
-audit_core "FQDN" "$FQDN" "$DETECTED_FQDN" "$OK"
+
+audit_core \
+    "FQDN" \
+    "$FQDN" \
+    "$DETECTED_FQDN" \
+    "$OK"
 
 [[ "$DETECTED_IP" == "$CIDR" ]] && OK=1 || OK=0
-audit_core "IPv4" "$CIDR" "$DETECTED_IP" "$OK"
+
+audit_core \
+    "IPv4" \
+    "$CIDR" \
+    "$DETECTED_IP" \
+    "$OK"
 
 [[ "$DETECTED_GW" == "$GW" ]] && OK=1 || OK=0
-audit_core "GATEWAY" "$GW" "$DETECTED_GW" "$OK"
+
+audit_core \
+    "GATEWAY" \
+    "$GW" \
+    "$DETECTED_GW" \
+    "$OK"
 
 # ============================================================
 # NTP REAL
 # ============================================================
 
-DETECTED_NTP="$(timedatectl timesync-status 2>/dev/null | awk '/Server:/ {print $2; exit}')"
+DETECTED_NTP="$(
+    timedatectl timesync-status 2>/dev/null |
+    awk '/Server:/ {print $2; exit}'
+)"
 
 [[ "$DETECTED_NTP" == "$NTP" ]] && OK=1 || OK=0
-audit_core "NTP" "$NTP" "$DETECTED_NTP" "$OK"
+
+audit_core \
+    "NTP" \
+    "$NTP" \
+    "$DETECTED_NTP" \
+    "$OK"
 
 # ============================================================
 # SAMBA REAL
 # ============================================================
 
-DETECTED_SAMBA_VERSION="$(samba --version 2>/dev/null | sed 's/^Version //')"
-DETECTED_SAMBA_SERVICE="$(systemctl is-active samba-ad-dc 2>/dev/null || true)"
-DETECTED_SERVER_ROLE="$(testparm -s --parameter-name='server role' 2>/dev/null | xargs)"
-DETECTED_REALM="$(testparm -s --parameter-name='realm' 2>/dev/null | xargs)"
-DETECTED_NETBIOS="$(testparm -s --parameter-name='workgroup' 2>/dev/null | xargs)"
+DETECTED_SAMBA_VERSION="$(
+    samba --version 2>/dev/null |
+    sed 's/^Version //'
+)"
+
+DETECTED_SAMBA_SERVICE="$(
+    systemctl is-active samba-ad-dc 2>/dev/null || true
+)"
+
+DETECTED_SERVER_ROLE="$(
+    testparm \
+        -s \
+        --parameter-name='server role' \
+        2>/dev/null |
+    xargs
+)"
+
+DETECTED_REALM="$(
+    testparm \
+        -s \
+        --parameter-name='realm' \
+        2>/dev/null |
+    xargs
+)"
+
+DETECTED_NETBIOS="$(
+    testparm \
+        -s \
+        --parameter-name='workgroup' \
+        2>/dev/null |
+    xargs
+)"
 
 [[ -n "$DETECTED_SAMBA_VERSION" ]] && OK=1 || OK=0
-audit_core "SAMBA VERSION" "versão detectável" "$DETECTED_SAMBA_VERSION" "$OK"
+
+audit_core \
+    "SAMBA VERSION" \
+    "versão detectável" \
+    "$DETECTED_SAMBA_VERSION" \
+    "$OK"
 
 [[ "$DETECTED_SAMBA_SERVICE" == "active" ]] && OK=1 || OK=0
-audit_core "SAMBA AD DC" "active" "$DETECTED_SAMBA_SERVICE" "$OK"
+
+audit_core \
+    "SAMBA AD DC" \
+    "active" \
+    "$DETECTED_SAMBA_SERVICE" \
+    "$OK"
 
 [[ "${DETECTED_SERVER_ROLE,,}" == *"active directory domain controller"* ]] && OK=1 || OK=0
-audit_core "SERVER ROLE" "AD Domain Controller" "$DETECTED_SERVER_ROLE" "$OK"
+
+audit_core \
+    "SERVER ROLE" \
+    "AD Domain Controller" \
+    "$DETECTED_SERVER_ROLE" \
+    "$OK"
 
 [[ "${DETECTED_REALM^^}" == "${REALM^^}" ]] && OK=1 || OK=0
-audit_core "REALM" "$REALM" "$DETECTED_REALM" "$OK"
+
+audit_core \
+    "REALM" \
+    "$REALM" \
+    "$DETECTED_REALM" \
+    "$OK"
 
 [[ "${DETECTED_NETBIOS^^}" == "${NETBIOS^^}" ]] && OK=1 || OK=0
-audit_core "NETBIOS" "$NETBIOS" "$DETECTED_NETBIOS" "$OK"
+
+audit_core \
+    "NETBIOS" \
+    "$NETBIOS" \
+    "$DETECTED_NETBIOS" \
+    "$OK"
 
 # ============================================================
-# DOMAIN / FOREST LEVEL REAIS
+# DOMAIN DN REAL
 # ============================================================
 
-LEVEL_INFO="$(samba-tool domain level show 2>/dev/null || true)"
+DETECTED_DOMAIN_DN="$(
+    ldbsearch \
+        -H "$SAMDB" \
+        -s base \
+        defaultNamingContext \
+        2>/dev/null |
+    sed -n 's/^defaultNamingContext: //p' |
+    head -1
+)"
 
-DETECTED_DOMAIN_LEVEL="$(printf "%s\n" "$LEVEL_INFO" | awk -F': ' '/Domain function level/ {print $2; exit}')"
-DETECTED_FOREST_LEVEL="$(printf "%s\n" "$LEVEL_INFO" | awk -F': ' '/Forest function level/ {print $2; exit}')"
+[[ "${DETECTED_DOMAIN_DN,,}" == "${DOMAIN_DN,,}" ]] && OK=1 || OK=0
+
+audit_core \
+    "DOMAIN DN" \
+    "$DOMAIN_DN" \
+    "$DETECTED_DOMAIN_DN" \
+    "$OK"
+
+# ============================================================
+# DOMAIN / FOREST LEVEL
+# ============================================================
+
+LEVEL_INFO="$(
+    samba-tool domain level show 2>/dev/null || true
+)"
+
+DETECTED_DOMAIN_LEVEL="$(
+    printf "%s\n" "$LEVEL_INFO" |
+    awk -F': ' '/Domain function level/ {print $2; exit}'
+)"
+
+DETECTED_FOREST_LEVEL="$(
+    printf "%s\n" "$LEVEL_INFO" |
+    awk -F': ' '/Forest function level/ {print $2; exit}'
+)"
 
 [[ -n "$DETECTED_DOMAIN_LEVEL" ]] && OK=1 || OK=0
-audit_core "DOMAIN LEVEL" "detectável" "$DETECTED_DOMAIN_LEVEL" "$OK"
+
+audit_core \
+    "DOMAIN LEVEL" \
+    "detectável" \
+    "$DETECTED_DOMAIN_LEVEL" \
+    "$OK"
 
 [[ -n "$DETECTED_FOREST_LEVEL" ]] && OK=1 || OK=0
-audit_core "FOREST LEVEL" "detectável" "$DETECTED_FOREST_LEVEL" "$OK"
+
+audit_core \
+    "FOREST LEVEL" \
+    "detectável" \
+    "$DETECTED_FOREST_LEVEL" \
+    "$OK"
 
 # ============================================================
-# DNS CONFIGURADO NO DC
+# DNS USADO PELO PRÓPRIO DC
 # ============================================================
 
-DETECTED_NAMESERVERS="$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf | paste -sd ' ' -)"
+DETECTED_NAMESERVERS="$(
+    awk \
+        '/^nameserver[[:space:]]+/ {print $2}' \
+        /etc/resolv.conf |
+    paste -sd ' ' -
+)"
 
 if [[ "$ROLE" == "PRIMARY" ]]; then
 
-    if [[ "$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)" == "$PRIMARY_IP" ]]; then
-        OK=1
-    else
-        OK=0
-    fi
+    FIRST_NS="$(
+        awk \
+            '/^nameserver/{print $2; exit}' \
+            /etc/resolv.conf
+    )"
 
-    audit_core "DNS DO DC" "$PRIMARY_IP primeiro" "$DETECTED_NAMESERVERS" "$OK"
+    [[ "$FIRST_NS" == "$PRIMARY_IP" ]] && OK=1 || OK=0
+
+    audit_core \
+        "DNS DO DC" \
+        "$PRIMARY_IP primeiro" \
+        "$DETECTED_NAMESERVERS" \
+        "$OK"
 
 else
 
-    FIRST_NS="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)"
+    FIRST_NS="$(
+        awk \
+            '/^nameserver/{print $2; exit}' \
+            /etc/resolv.conf
+    )"
 
-    if [[ "$FIRST_NS" == "$SECONDARY_IP" && " $DETECTED_NAMESERVERS " == *" $PRIMARY_IP "* ]]; then
+    if [[ "$FIRST_NS" == "$SECONDARY_IP" &&
+          " $DETECTED_NAMESERVERS " == *" $PRIMARY_IP "* ]]
+    then
         OK=1
     else
         OK=0
     fi
 
-    audit_core "DNS DO DC" "${SECONDARY_IP} + ${PRIMARY_IP}" "$DETECTED_NAMESERVERS" "$OK"
+    audit_core \
+        "DNS DO DC" \
+        "${SECONDARY_IP} + ${PRIMARY_IP}" \
+        "$DETECTED_NAMESERVERS" \
+        "$OK"
 
 fi
 
@@ -1021,26 +1669,63 @@ fi
 # FORWARDERS REAIS
 # ============================================================
 
-DETECTED_FORWARDERS="$(testparm -s --parameter-name='dns forwarder' 2>/dev/null | xargs)"
+DETECTED_FORWARDERS="$(
+    testparm \
+        -s \
+        --parameter-name='dns forwarder' \
+        2>/dev/null |
+    xargs
+)"
 
 if [[ " $DETECTED_FORWARDERS " == *" $PIHOLE1 "* &&
-      " $DETECTED_FORWARDERS " == *" $PIHOLE2 "* ]]; then
+      " $DETECTED_FORWARDERS " == *" $PIHOLE2 "* ]]
+then
     OK=1
 else
     OK=0
 fi
 
-audit_core "DNS FORWARDERS" "${PIHOLE1} ${PIHOLE2}" "$DETECTED_FORWARDERS" "$OK"
+audit_core \
+    "DNS FORWARDERS" \
+    "${PIHOLE1} ${PIHOLE2}" \
+    "$DETECTED_FORWARDERS" \
+    "$OK"
 
 # ============================================================
-# DNS DIRETO NO SAMBA
+# DNS A DIRETO NO SAMBA
 # ============================================================
 
-DETECTED_AD1_A="$(dig +time=2 +tries=1 +short @127.0.0.1 A "$PRIMARY_FQDN" | grep -E '^[0-9.]+' | head -1 || true)"
-DETECTED_AD2_A="$(dig +time=2 +tries=1 +short @127.0.0.1 A "$SECONDARY_FQDN" | grep -E '^[0-9.]+' | head -1 || true)"
+DETECTED_AD1_A="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        A \
+        "$PRIMARY_FQDN" |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+    head -1 || true
+)"
+
+DETECTED_AD2_A="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        A \
+        "$SECONDARY_FQDN" |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+    head -1 || true
+)"
 
 [[ "$DETECTED_AD1_A" == "$PRIMARY_IP" ]] && OK=1 || OK=0
-audit_core "SAMBA DNS -> AD01" "$PRIMARY_IP" "$DETECTED_AD1_A" "$OK"
+
+audit_core \
+    "SAMBA DNS -> AD01" \
+    "$PRIMARY_IP" \
+    "$DETECTED_AD1_A" \
+    "$OK"
 
 SECONDARY_PRESENT=0
 
@@ -1051,30 +1736,83 @@ fi
 if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
 
     [[ "$DETECTED_AD2_A" == "$SECONDARY_IP" ]] && OK=1 || OK=0
-    audit_core "SAMBA DNS -> AD02" "$SECONDARY_IP" "$DETECTED_AD2_A" "$OK"
+
+    audit_core \
+        "SAMBA DNS -> AD02" \
+        "$SECONDARY_IP" \
+        "$DETECTED_AD2_A" \
+        "$OK"
 
 fi
 
 # ============================================================
-# ZONA / PTR DIRETO NO SAMBA
+# ZONA REVERSA
 # ============================================================
 
-DETECTED_REVERSE_SOA="$(dig +time=2 +tries=1 +short @127.0.0.1 SOA "$REVERSE_ZONE" | xargs || true)"
+DETECTED_REVERSE_SOA="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        SOA \
+        "$REVERSE_ZONE" |
+    xargs || true
+)"
 
 [[ -n "$DETECTED_REVERSE_SOA" ]] && OK=1 || OK=0
-audit_core "ZONA REVERSA" "$REVERSE_ZONE disponível" "$DETECTED_REVERSE_SOA" "$OK"
 
-DETECTED_AD1_PTR="$(dig +time=2 +tries=1 +short @127.0.0.1 -x "$PRIMARY_IP" | sed 's/\.$//' | head -1 || true)"
+audit_core \
+    "ZONA REVERSA" \
+    "${REVERSE_ZONE} disponível" \
+    "$DETECTED_REVERSE_SOA" \
+    "$OK"
+
+# ============================================================
+# PTR
+# ============================================================
+
+DETECTED_AD1_PTR="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        -x \
+        "$PRIMARY_IP" |
+    sed 's/\.$//' |
+    head -1 || true
+)"
 
 [[ "${DETECTED_AD1_PTR,,}" == "${PRIMARY_FQDN,,}" ]] && OK=1 || OK=0
-audit_core "SAMBA PTR -> AD01" "$PRIMARY_FQDN" "$DETECTED_AD1_PTR" "$OK"
+
+audit_core \
+    "SAMBA PTR -> AD01" \
+    "$PRIMARY_FQDN" \
+    "$DETECTED_AD1_PTR" \
+    "$OK"
 
 if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
 
-    DETECTED_AD2_PTR="$(dig +time=2 +tries=1 +short @127.0.0.1 -x "$SECONDARY_IP" | sed 's/\.$//' | head -1 || true)"
+    DETECTED_AD2_PTR="$(
+        dig \
+            +time=2 \
+            +tries=1 \
+            +short \
+            @127.0.0.1 \
+            -x \
+            "$SECONDARY_IP" |
+        sed 's/\.$//' |
+        head -1 || true
+    )"
 
     [[ "${DETECTED_AD2_PTR,,}" == "${SECONDARY_FQDN,,}" ]] && OK=1 || OK=0
-    audit_core "SAMBA PTR -> AD02" "$SECONDARY_FQDN" "$DETECTED_AD2_PTR" "$OK"
+
+    audit_core \
+        "SAMBA PTR -> AD02" \
+        "$SECONDARY_FQDN" \
+        "$DETECTED_AD2_PTR" \
+        "$OK"
 
 fi
 
@@ -1082,7 +1820,15 @@ fi
 # LDAP SRV
 # ============================================================
 
-LDAP_RESULT="$(dig +time=2 +tries=1 +short @127.0.0.1 SRV "_ldap._tcp.dc._msdcs.${DOMAIN}" || true)"
+LDAP_RESULT="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        SRV \
+        "_ldap._tcp.dc._msdcs.${DOMAIN}" || true
+)"
 
 LDAP_OK=1
 
@@ -1092,15 +1838,35 @@ if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
     grep -qi "${SECONDARY_FQDN}\.$" <<<"$LDAP_RESULT" || LDAP_OK=0
 fi
 
-LDAP_DETECTED="$(printf "%s\n" "$LDAP_RESULT" | awk '{print $NF}' | sed 's/\.$//' | sort -u | tr '\n' ' ' | xargs)"
+LDAP_DETECTED="$(
+    printf "%s\n" "$LDAP_RESULT" |
+    awk '{print $NF}' |
+    sed 's/\.$//' |
+    tr '[:upper:]' '[:lower:]' |
+    sort -u |
+    tr '\n' ' ' |
+    xargs
+)"
 
-audit_core "LDAP SRV" "DCs registrados" "$LDAP_DETECTED" "$LDAP_OK"
+audit_core \
+    "LDAP SRV" \
+    "DCs registrados" \
+    "$LDAP_DETECTED" \
+    "$LDAP_OK"
 
 # ============================================================
 # KERBEROS SRV
 # ============================================================
 
-KERBEROS_RESULT="$(dig +time=2 +tries=1 +short @127.0.0.1 SRV "_kerberos._tcp.${DOMAIN}" || true)"
+KERBEROS_RESULT="$(
+    dig \
+        +time=2 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        SRV \
+        "_kerberos._tcp.${DOMAIN}" || true
+)"
 
 KERBEROS_OK=1
 
@@ -1110,19 +1876,45 @@ if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
     grep -qi "${SECONDARY_FQDN}\.$" <<<"$KERBEROS_RESULT" || KERBEROS_OK=0
 fi
 
-KERBEROS_DETECTED="$(printf "%s\n" "$KERBEROS_RESULT" | awk '{print $NF}' | sed 's/\.$//' | sort -u | tr '\n' ' ' | xargs)"
+KERBEROS_DETECTED="$(
+    printf "%s\n" "$KERBEROS_RESULT" |
+    awk '{print $NF}' |
+    sed 's/\.$//' |
+    tr '[:upper:]' '[:lower:]' |
+    sort -u |
+    tr '\n' ' ' |
+    xargs
+)"
 
-audit_core "KERBEROS SRV" "DCs registrados" "$KERBEROS_DETECTED" "$KERBEROS_OK"
+audit_core \
+    "KERBEROS SRV" \
+    "DCs registrados" \
+    "$KERBEROS_DETECTED" \
+    "$KERBEROS_OK"
 
 # ============================================================
-# DNS EXTERNO VIA SAMBA -> PI-HOLE
+# DNS EXTERNO ATRAVÉS DO SAMBA
 # ============================================================
 
-DNS_EXTERNAL_RESULT="$(dig +time=3 +tries=1 +short @127.0.0.1 A debian.org | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+DNS_EXTERNAL_RESULT="$(
+    dig \
+        +time=3 \
+        +tries=1 \
+        +short \
+        @127.0.0.1 \
+        A \
+        debian.org |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+    head -1 || true
+)"
 
 [[ -n "$DNS_EXTERNAL_RESULT" ]] && OK=1 || OK=0
 
-audit_core "DNS EXTERNO VIA SAMBA" "IPv4 válido" "${DNS_EXTERNAL_RESULT:-sem resposta}" "$OK"
+audit_core \
+    "DNS EXTERNO VIA SAMBA" \
+    "IPv4 válido" \
+    "${DNS_EXTERNAL_RESULT:-sem resposta}" \
+    "$OK"
 
 # ============================================================
 # KERBEROS AUTH REAL
@@ -1132,8 +1924,12 @@ KRB5CCNAME="/tmp/krb5cc_samba_ad_audit"
 
 rm -f "$KRB5CCNAME"
 
-if printf "%s\n" "$ADPASS" | KRB5CCNAME="$KRB5CCNAME" kinit Administrator >/dev/null 2>&1 &&
-   KRB5CCNAME="$KRB5CCNAME" klist -s; then
+if printf "%s\n" "$ADPASS" |
+   KRB5CCNAME="$KRB5CCNAME" \
+   kinit Administrator >/dev/null 2>&1 &&
+   KRB5CCNAME="$KRB5CCNAME" \
+   klist -s
+then
 
     OK=1
     DETECTED="ticket obtido"
@@ -1146,23 +1942,39 @@ else
 fi
 
 KRB5CCNAME="$KRB5CCNAME" kdestroy >/dev/null 2>&1 || true
+
 rm -f "$KRB5CCNAME"
 
-audit_core "KERBEROS AUTH" "ticket válido" "$DETECTED" "$OK"
+audit_core \
+    "KERBEROS AUTH" \
+    "ticket válido" \
+    "$DETECTED" \
+    "$OK"
 
 # ============================================================
-# DATABASE REAL
+# DATABASE
 # ============================================================
 
-DBOUT="$(samba-tool dbcheck --cross-ncs 2>&1 || true)"
-DBSUMMARY="$(printf "%s\n" "$DBOUT" | grep -E 'Checked .* objects' | tail -1)"
+DBOUT="$(
+    samba-tool dbcheck --cross-ncs 2>&1 || true
+)"
+
+DBSUMMARY="$(
+    printf "%s\n" "$DBOUT" |
+    grep -E 'Checked .* objects' |
+    tail -1
+)"
 
 grep -Eq 'Checked .* objects \(0 errors\)' <<<"$DBOUT" && OK=1 || OK=0
 
-audit_core "DATABASE" "0 errors" "${DBSUMMARY:-dbcheck sem resumo}" "$OK"
+audit_core \
+    "DATABASE" \
+    "0 errors" \
+    "${DBSUMMARY:-dbcheck sem resumo}" \
+    "$OK"
 
 # ============================================================
-# SYSVOL ACL REAL
+# SYSVOL ACL
 # ============================================================
 
 if samba-tool ntacl sysvolcheck >/dev/null 2>&1; then
@@ -1177,18 +1989,33 @@ else
 
 fi
 
-audit_core "SYSVOL ACL" "ACL válida" "$DETECTED" "$OK"
+audit_core \
+    "SYSVOL ACL" \
+    "ACL válida" \
+    "$DETECTED" \
+    "$OK"
 
 # ============================================================
-# FSMO REAL
+# FSMO
 # ============================================================
 
-FSMO_INFO="$(samba-tool fsmo show 2>/dev/null || true)"
+FSMO_INFO="$(
+    samba-tool fsmo show 2>/dev/null || true
+)"
 
-FSMO_TOTAL="$(printf "%s\n" "$FSMO_INFO" | grep -c ':' || true)"
-FSMO_PRIMARY="$(printf "%s\n" "$FSMO_INFO" | grep -ic "$PRIMARY_HOSTNAME" || true)"
+FSMO_TOTAL="$(
+    printf "%s\n" "$FSMO_INFO" |
+    grep -c ':' || true
+)"
 
-if [[ "$FSMO_TOTAL" -ge 5 && "$FSMO_PRIMARY" -eq "$FSMO_TOTAL" ]]; then
+FSMO_PRIMARY="$(
+    printf "%s\n" "$FSMO_INFO" |
+    grep -ic "$PRIMARY_HOSTNAME" || true
+)"
+
+if [[ "$FSMO_TOTAL" -ge 5 &&
+      "$FSMO_PRIMARY" -eq "$FSMO_TOTAL" ]]
+then
 
     OK=1
     DETECTED="${PRIMARY_HOSTNAME} possui ${FSMO_PRIMARY}/${FSMO_TOTAL}"
@@ -1196,60 +2023,128 @@ if [[ "$FSMO_TOTAL" -ge 5 && "$FSMO_PRIMARY" -eq "$FSMO_TOTAL" ]]; then
 else
 
     OK=0
-    DETECTED="$(printf "%s\n" "$FSMO_INFO" | tr '\n' ';' | cut -c1-250)"
+
+    DETECTED="$(
+        printf "%s\n" "$FSMO_INFO" |
+        tr '\n' ';' |
+        cut -c1-250
+    )"
 
 fi
 
-audit_core "FSMO" "$PRIMARY_HOSTNAME possui todos" "$DETECTED" "$OK"
+audit_core \
+    "FSMO" \
+    "${PRIMARY_HOSTNAME} possui todos" \
+    "$DETECTED" \
+    "$OK"
 
 # ============================================================
-# REPLICAÇÃO AD REAL
+# REPLICAÇÃO AD VIA JSON
 # ============================================================
 
 if [[ "$ROLE" == "SECONDARY" ]]; then
 
-    LOCAL_DRS_RC=1
-    REMOTE_DRS_RC=1
+    WAITED=0
 
-    if samba-tool drs showrepl --summary >/tmp/drs-local-audit.txt 2>&1; then
-        LOCAL_DRS_RC=0
-    fi
+    LOCAL_DRS_ANALYSIS="ERRO|não executado"
+    REMOTE_DRS_ANALYSIS="ERRO|não executado"
 
-    if ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "samba-tool drs showrepl --summary" >/tmp/drs-primary-audit.txt 2>&1; then
-        REMOTE_DRS_RC=0
-    fi
+    while (( WAITED < DRS_WAIT_SECONDS )); do
 
-    if [[ "$LOCAL_DRS_RC" == "0" && "$REMOTE_DRS_RC" == "0" ]]; then
+        LOCAL_DRS_JSON="$(
+            samba-tool drs showrepl --json 2>/dev/null || true
+        )"
+
+        REMOTE_DRS_JSON="$(
+            ssh \
+                -i "$SYSVOL_KEY" \
+                -o BatchMode=yes \
+                "root@${PRIMARY_IP}" \
+                "samba-tool drs showrepl --json" \
+                2>/dev/null || true
+        )"
+
+        LOCAL_DRS_ANALYSIS="$(
+            printf "%s" "$LOCAL_DRS_JSON" |
+            python3 \
+                "$DRS_ANALYZER" \
+                "$PRIMARY_HOSTNAME"
+        )"
+
+        REMOTE_DRS_ANALYSIS="$(
+            printf "%s" "$REMOTE_DRS_JSON" |
+            python3 \
+                "$DRS_ANALYZER" \
+                "$SECONDARY_HOSTNAME"
+        )"
+
+        LOCAL_DRS_STATE="${LOCAL_DRS_ANALYSIS%%|*}"
+        REMOTE_DRS_STATE="${REMOTE_DRS_ANALYSIS%%|*}"
+
+        if [[ "$LOCAL_DRS_STATE" == "OK" &&
+              "$REMOTE_DRS_STATE" == "OK" ]]
+        then
+            break
+        fi
+
+        sleep 5
+
+        WAITED=$((WAITED + 5))
+
+    done
+
+    LOCAL_DRS_STATE="${LOCAL_DRS_ANALYSIS%%|*}"
+    REMOTE_DRS_STATE="${REMOTE_DRS_ANALYSIS%%|*}"
+
+    if [[ "$LOCAL_DRS_STATE" == "OK" &&
+          "$REMOTE_DRS_STATE" == "OK" ]]
+    then
 
         OK=1
-        DETECTED="AD01=OK AD02=OK"
 
     else
 
         OK=0
-        DETECTED="AD01_RC=${REMOTE_DRS_RC} AD02_RC=${LOCAL_DRS_RC}"
 
     fi
 
-    audit_core "REPLICACAO AD" "AD01=OK AD02=OK" "$DETECTED" "$OK"
+    DETECTED="AD01=${REMOTE_DRS_ANALYSIS} / AD02=${LOCAL_DRS_ANALYSIS}"
+
+    audit_core \
+        "REPLICACAO AD" \
+        "AD01<->AD02 sem falhas" \
+        "$DETECTED" \
+        "$OK"
 
 fi
 
 # ============================================================
-# SYSVOL SYNC REAL
+# SYSVOL TIMER / SYNC REAL
 # ============================================================
 
 if [[ "$ROLE" == "PRIMARY" ]]; then
 
-    ACL_TIMER="$(systemctl is-active samba-sysvol-acl-check.timer 2>/dev/null || true)"
+    ACL_TIMER="$(
+        systemctl is-active \
+            samba-sysvol-acl-check.timer \
+            2>/dev/null || true
+    )"
 
     [[ "$ACL_TIMER" == "active" ]] && OK=1 || OK=0
 
-    audit_core "SYSVOL ACL TIMER" "active" "$ACL_TIMER" "$OK"
+    audit_core \
+        "SYSVOL ACL TIMER" \
+        "active" \
+        "$ACL_TIMER" \
+        "$OK"
 
 else
 
-    SYSVOL_TIMER="$(systemctl is-active samba-sysvol-sync.timer 2>/dev/null || true)"
+    SYSVOL_TIMER="$(
+        systemctl is-active \
+            samba-sysvol-sync.timer \
+            2>/dev/null || true
+    )"
 
     SYSVOL_RUN_RC=1
 
@@ -1257,25 +2152,52 @@ else
         SYSVOL_RUN_RC=0
     fi
 
-    SYSVOL_DIFF="$(rsync -nrc --delete -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" "root@${PRIMARY_IP}:${SYSVOL}/" "${SYSVOL}/" 2>/dev/null || true)"
+    SYSVOL_DIFF="$(
+        rsync \
+            -nrc \
+            --delete \
+            -e "ssh -i ${SYSVOL_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+            "root@${PRIMARY_IP}:${SYSVOL}/" \
+            "${SYSVOL}/" \
+            2>/dev/null || true
+    )"
 
-    SYSVOL_INTERVAL="$(systemctl cat samba-sysvol-sync.timer 2>/dev/null | sed -n 's/^OnUnitActiveSec=//p' | tail -1)"
+    SYSVOL_INTERVAL="$(
+        systemctl cat \
+            samba-sysvol-sync.timer \
+            2>/dev/null |
+        sed -n 's/^OnUnitActiveSec=//p' |
+        tail -1
+    )"
 
     if [[ "$SYSVOL_TIMER" == "active" &&
           "$SYSVOL_RUN_RC" == "0" &&
-          -z "$SYSVOL_DIFF" ]]; then
+          -z "$SYSVOL_DIFF" ]]
+    then
 
         OK=1
+
         DETECTED="timer=active sync=OK diff=0 intervalo=${SYSVOL_INTERVAL}"
 
     else
 
         OK=0
-        DETECTED="timer=${SYSVOL_TIMER} sync_rc=${SYSVOL_RUN_RC} diff=$([[ -z "$SYSVOL_DIFF" ]] && echo 0 || echo 1)"
+
+        if [[ -z "$SYSVOL_DIFF" ]]; then
+            DIFF_STATE="0"
+        else
+            DIFF_STATE="1"
+        fi
+
+        DETECTED="timer=${SYSVOL_TIMER} sync_rc=${SYSVOL_RUN_RC} diff=${DIFF_STATE}"
 
     fi
 
-    audit_core "SYSVOL SYNC" "timer ativo / diff=0" "$DETECTED" "$OK"
+    audit_core \
+        "SYSVOL SYNC" \
+        "timer ativo / diff=0" \
+        "$DETECTED" \
+        "$OK"
 
 fi
 
@@ -1285,53 +2207,64 @@ fi
 
 if [[ "$ROLE" == "SECONDARY" ]]; then
 
-    IDMAP_TIMER="$(systemctl is-active samba-idmap-sync.timer 2>/dev/null || true)"
+    IDMAP_TIMER="$(
+        systemctl is-active \
+            samba-idmap-sync.timer \
+            2>/dev/null || true
+    )"
 
-    LOCAL_ADMIN_GID="$(wbinfo --sid-to-gid S-1-5-32-544 2>/dev/null || true)"
+    LOCAL_ADMIN_GID="$(
+        wbinfo \
+            --sid-to-gid \
+            S-1-5-32-544 \
+            2>/dev/null || true
+    )"
 
-    PRIMARY_ADMIN_GID="$(ssh -i "$SYSVOL_KEY" -o BatchMode=yes "root@${PRIMARY_IP}" "wbinfo --sid-to-gid S-1-5-32-544" 2>/dev/null || true)"
+    PRIMARY_ADMIN_GID="$(
+        ssh \
+            -i "$SYSVOL_KEY" \
+            -o BatchMode=yes \
+            "root@${PRIMARY_IP}" \
+            "wbinfo --sid-to-gid S-1-5-32-544" \
+            2>/dev/null || true
+    )"
 
-    IDMAP_INTERVAL="$(systemctl cat samba-idmap-sync.timer 2>/dev/null | sed -n 's/^OnUnitActiveSec=//p' | tail -1)"
+    IDMAP_INTERVAL="$(
+        systemctl cat \
+            samba-idmap-sync.timer \
+            2>/dev/null |
+        sed -n 's/^OnUnitActiveSec=//p' |
+        tail -1
+    )"
 
     if [[ "$IDMAP_TIMER" == "active" &&
           -n "$LOCAL_ADMIN_GID" &&
-          "$LOCAL_ADMIN_GID" == "$PRIMARY_ADMIN_GID" ]]; then
+          "$LOCAL_ADMIN_GID" == "$PRIMARY_ADMIN_GID" ]]
+    then
 
         OK=1
+
         DETECTED="GID=${LOCAL_ADMIN_GID} timer=active intervalo=${IDMAP_INTERVAL}"
 
     else
 
         OK=0
+
         DETECTED="AD01_GID=${PRIMARY_ADMIN_GID:-?} AD02_GID=${LOCAL_ADMIN_GID:-?} timer=${IDMAP_TIMER}"
 
     fi
 
-    audit_core "IDMAP SYNC" "mesmo GID / timer ativo" "$DETECTED" "$OK"
+    audit_core \
+        "IDMAP SYNC" \
+        "mesmo GID / timer ativo" \
+        "$DETECTED" \
+        "$OK"
 
 fi
 
 # ============================================================
-# BASE DE COMPARAÇÃO PARA TESTES DOS PI-HOLE
+# TESTES REAIS DOS PI-HOLE
 #
-# COMPARAMOS A RESPOSTA DO PI-HOLE COM A RESPOSTA DIRETA
-# DO SAMBA, NÃO APENAS COM VARIÁVEIS DE ENTRADA.
-# ============================================================
-
-DIRECT_SOA="$(dig +time=2 +tries=1 +short @127.0.0.1 SOA "$DOMAIN" | xargs || true)"
-
-DIRECT_LDAP_NORMALIZED="$(
-    dig +time=2 +tries=1 +short @127.0.0.1 SRV "_ldap._tcp.dc._msdcs.${DOMAIN}" |
-    awk '{print $4}' |
-    sed 's/\.$//' |
-    tr '[:upper:]' '[:lower:]' |
-    sort -u |
-    tr '\n' ' ' |
-    xargs
-)"
-
-# ============================================================
-# TESTE REAL:
 # DC -> PI-HOLE -> AD
 # DC -> PI-HOLE -> INTERNET
 # ============================================================
@@ -1340,51 +2273,154 @@ for DNS_SERVER in "$PIHOLE1" "$PIHOLE2"; do
 
     DNS_LABEL="PIHOLE ${DNS_SERVER}"
 
-    # --------------------------------------------------------
-    # SOA DA ZONA AD
-    # --------------------------------------------------------
+    # ========================================================
+    # SOA
+    #
+    # NÃO COMPARAMOS MNAME NEM SERIAL EXATO ENTRE DCs.
+    #
+    # É VÁLIDO:
+    # MNAME = AD01 OU AD02
+    # RNAME = hostmaster.DOMAIN
+    # SERIAL = NÚMERO > 0
+    # ========================================================
 
-    PI_SOA="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" SOA "$DOMAIN" | xargs || true)"
+    PI_SOA="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            SOA \
+            "$DOMAIN" |
+        head -1 || true
+    )"
 
-    if [[ -n "$DIRECT_SOA" && "$PI_SOA" == "$DIRECT_SOA" ]]; then
-        OK=1
-    else
-        OK=0
+    SOA_MNAME=""
+    SOA_RNAME=""
+    SOA_SERIAL=""
+
+    if [[ -n "$PI_SOA" ]]; then
+
+        read -r \
+            SOA_MNAME \
+            SOA_RNAME \
+            SOA_SERIAL \
+            SOA_REFRESH \
+            SOA_RETRY \
+            SOA_EXPIRE \
+            SOA_MINIMUM \
+            <<<"$PI_SOA"
+
     fi
 
-    audit_pihole "${DNS_LABEL} -> SOA" "$DIRECT_SOA" "${PI_SOA:-sem resposta}" "$OK"
+    SOA_MNAME="${SOA_MNAME%.}"
+    SOA_RNAME="${SOA_RNAME%.}"
 
-    # --------------------------------------------------------
+    SOA_EXPECTED_RNAME="hostmaster.${DOMAIN}"
+
+    SOA_OK=1
+
+    if [[ "${SOA_MNAME,,}" != "${PRIMARY_FQDN,,}" &&
+          "${SOA_MNAME,,}" != "${SECONDARY_FQDN,,}" ]]
+    then
+        SOA_OK=0
+    fi
+
+    if [[ "${SOA_RNAME,,}" != "${SOA_EXPECTED_RNAME,,}" ]]; then
+        SOA_OK=0
+    fi
+
+    if [[ ! "$SOA_SERIAL" =~ ^[0-9]+$ ]]; then
+        SOA_OK=0
+    elif [[ "$SOA_SERIAL" -le 0 ]]; then
+        SOA_OK=0
+    fi
+
+    SOA_DETECTED="MNAME=${SOA_MNAME:-?} SERIAL=${SOA_SERIAL:-?}"
+
+    audit_pihole \
+        "${DNS_LABEL} -> SOA" \
+        "SOA AD válido" \
+        "$SOA_DETECTED" \
+        "$SOA_OK"
+
+    # ========================================================
     # AD01 A
-    # --------------------------------------------------------
+    # ========================================================
 
-    PI_AD1="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" A "$PRIMARY_FQDN" | grep -E '^[0-9.]+' | head -1 || true)"
+    PI_AD1="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            A \
+            "$PRIMARY_FQDN" |
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+        head -1 || true
+    )"
 
     [[ "$PI_AD1" == "$PRIMARY_IP" ]] && OK=1 || OK=0
 
-    audit_pihole "${DNS_LABEL} -> AD01 A" "$PRIMARY_IP" "${PI_AD1:-sem resposta}" "$OK"
+    audit_pihole \
+        "${DNS_LABEL} -> AD01 A" \
+        "$PRIMARY_IP" \
+        "${PI_AD1:-sem resposta}" \
+        "$OK"
 
-    # --------------------------------------------------------
+    # ========================================================
     # AD02 A
-    # --------------------------------------------------------
+    # ========================================================
 
     if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
 
-        PI_AD2="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" A "$SECONDARY_FQDN" | grep -E '^[0-9.]+' | head -1 || true)"
+        PI_AD2="$(
+            dig \
+                +time=3 \
+                +tries=1 \
+                +short \
+                @"$DNS_SERVER" \
+                A \
+                "$SECONDARY_FQDN" |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+            head -1 || true
+        )"
 
         [[ "$PI_AD2" == "$SECONDARY_IP" ]] && OK=1 || OK=0
 
-        audit_pihole "${DNS_LABEL} -> AD02 A" "$SECONDARY_IP" "${PI_AD2:-sem resposta}" "$OK"
+        audit_pihole \
+            "${DNS_LABEL} -> AD02 A" \
+            "$SECONDARY_IP" \
+            "${PI_AD2:-sem resposta}" \
+            "$OK"
 
     fi
 
-    # --------------------------------------------------------
+    # ========================================================
     # LDAP SRV
-    # --------------------------------------------------------
+    # ========================================================
 
-    PI_LDAP_NORMALIZED="$(
-        dig +time=3 +tries=1 +short @"$DNS_SERVER" SRV "_ldap._tcp.dc._msdcs.${DOMAIN}" |
-        awk '{print $4}' |
+    PI_LDAP="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            SRV \
+            "_ldap._tcp.dc._msdcs.${DOMAIN}" || true
+    )"
+
+    PI_LDAP_OK=1
+
+    grep -qi "${PRIMARY_FQDN}\.$" <<<"$PI_LDAP" || PI_LDAP_OK=0
+
+    if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
+        grep -qi "${SECONDARY_FQDN}\.$" <<<"$PI_LDAP" || PI_LDAP_OK=0
+    fi
+
+    PI_LDAP_DETECTED="$(
+        printf "%s\n" "$PI_LDAP" |
+        awk '{print $NF}' |
         sed 's/\.$//' |
         tr '[:upper:]' '[:lower:]' |
         sort -u |
@@ -1392,48 +2428,125 @@ for DNS_SERVER in "$PIHOLE1" "$PIHOLE2"; do
         xargs
     )"
 
-    if [[ -n "$DIRECT_LDAP_NORMALIZED" &&
-          "$PI_LDAP_NORMALIZED" == "$DIRECT_LDAP_NORMALIZED" ]]; then
-        OK=1
-    else
-        OK=0
+    audit_pihole \
+        "${DNS_LABEL} -> LDAP SRV" \
+        "AD01 + AD02" \
+        "${PI_LDAP_DETECTED:-sem resposta}" \
+        "$PI_LDAP_OK"
+
+    # ========================================================
+    # KERBEROS SRV
+    # ========================================================
+
+    PI_KRB="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            SRV \
+            "_kerberos._tcp.${DOMAIN}" || true
+    )"
+
+    PI_KRB_OK=1
+
+    grep -qi "${PRIMARY_FQDN}\.$" <<<"$PI_KRB" || PI_KRB_OK=0
+
+    if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
+        grep -qi "${SECONDARY_FQDN}\.$" <<<"$PI_KRB" || PI_KRB_OK=0
     fi
 
-    audit_pihole "${DNS_LABEL} -> LDAP SRV" "$DIRECT_LDAP_NORMALIZED" "${PI_LDAP_NORMALIZED:-sem resposta}" "$OK"
+    PI_KRB_DETECTED="$(
+        printf "%s\n" "$PI_KRB" |
+        awk '{print $NF}' |
+        sed 's/\.$//' |
+        tr '[:upper:]' '[:lower:]' |
+        sort -u |
+        tr '\n' ' ' |
+        xargs
+    )"
 
-    # --------------------------------------------------------
+    audit_pihole \
+        "${DNS_LABEL} -> KRB SRV" \
+        "AD01 + AD02" \
+        "${PI_KRB_DETECTED:-sem resposta}" \
+        "$PI_KRB_OK"
+
+    # ========================================================
     # PTR AD01
-    # --------------------------------------------------------
+    # ========================================================
 
-    PI_PTR1="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" -x "$PRIMARY_IP" | sed 's/\.$//' | head -1 || true)"
+    PI_PTR1="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            -x \
+            "$PRIMARY_IP" |
+        sed 's/\.$//' |
+        head -1 || true
+    )"
 
     [[ "${PI_PTR1,,}" == "${PRIMARY_FQDN,,}" ]] && OK=1 || OK=0
 
-    audit_pihole "${DNS_LABEL} -> PTR AD01" "$PRIMARY_FQDN" "${PI_PTR1:-sem resposta}" "$OK"
+    audit_pihole \
+        "${DNS_LABEL} -> PTR AD01" \
+        "$PRIMARY_FQDN" \
+        "${PI_PTR1:-sem resposta}" \
+        "$OK"
 
-    # --------------------------------------------------------
+    # ========================================================
     # PTR AD02
-    # --------------------------------------------------------
+    # ========================================================
 
     if [[ "$ROLE" == "SECONDARY" || "$SECONDARY_PRESENT" == "1" ]]; then
 
-        PI_PTR2="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" -x "$SECONDARY_IP" | sed 's/\.$//' | head -1 || true)"
+        PI_PTR2="$(
+            dig \
+                +time=3 \
+                +tries=1 \
+                +short \
+                @"$DNS_SERVER" \
+                -x \
+                "$SECONDARY_IP" |
+            sed 's/\.$//' |
+            head -1 || true
+        )"
 
         [[ "${PI_PTR2,,}" == "${SECONDARY_FQDN,,}" ]] && OK=1 || OK=0
 
-        audit_pihole "${DNS_LABEL} -> PTR AD02" "$SECONDARY_FQDN" "${PI_PTR2:-sem resposta}" "$OK"
+        audit_pihole \
+            "${DNS_LABEL} -> PTR AD02" \
+            "$SECONDARY_FQDN" \
+            "${PI_PTR2:-sem resposta}" \
+            "$OK"
 
     fi
 
-    # --------------------------------------------------------
+    # ========================================================
     # INTERNET
-    # --------------------------------------------------------
+    # ========================================================
 
-    PI_INTERNET="$(dig +time=3 +tries=1 +short @"$DNS_SERVER" A debian.org | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+    PI_INTERNET="$(
+        dig \
+            +time=3 \
+            +tries=1 \
+            +short \
+            @"$DNS_SERVER" \
+            A \
+            debian.org |
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+        head -1 || true
+    )"
 
     [[ -n "$PI_INTERNET" ]] && OK=1 || OK=0
 
-    audit_pihole "${DNS_LABEL} -> INTERNET" "IPv4 válido" "${PI_INTERNET:-sem resposta}" "$OK"
+    audit_pihole \
+        "${DNS_LABEL} -> INTERNET" \
+        "IPv4 válido" \
+        "${PI_INTERNET:-sem resposta}" \
+        "$OK"
 
 done
 
@@ -1453,15 +2566,21 @@ else
     PIHOLE_STATUS="ERRO"
 fi
 
-FINAL_STATUS="OK"
+if [[ "$CORE_STATUS" == "OK" &&
+      "$PIHOLE_STATUS" == "OK" ]]
+then
 
-if [[ "$CORE_STATUS" == "ERRO" ]]; then
+    FINAL_STATUS="OK"
+
+else
+
     FINAL_STATUS="ERRO"
-elif [[ "$PIHOLE_STATUS" == "ERRO" && "$REQUIRE_PIHOLE_AUDIT" == "yes" ]]; then
-    FINAL_STATUS="ERRO"
-elif [[ "$PIHOLE_STATUS" == "ERRO" ]]; then
-    FINAL_STATUS="OK - PIHOLE PENDENTE/ERRO"
+
 fi
+
+# ============================================================
+# LIMPEZA
+# ============================================================
 
 cleanup_secrets
 
@@ -1524,7 +2643,7 @@ clear 2>/dev/null || true
 
 cat "$RESULT"
 
-if [[ "$FINAL_STATUS" == "ERRO" ]]; then
+if [[ "$FINAL_STATUS" != "OK" ]]; then
     exit 1
 fi
 
